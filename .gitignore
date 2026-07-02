@@ -1,0 +1,10 @@
+.browser/
+.venv/
+.env
+data/
+.agents/
+.codex/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
