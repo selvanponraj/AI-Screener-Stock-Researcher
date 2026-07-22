@@ -4,3 +4,10 @@ openpyxl==3.1.5
 requests==2.32.3
 pypdf==4.3.1
 chromadb==0.5.23
+posthog==3.7.4
+python-dotenv==1.0.1
+langchain-text-splitters==0.3.5
+langgraph==0.2.76
+pydantic==2.10.6
+sentence-transformers==3.4.1
+ddgs==9.8.0

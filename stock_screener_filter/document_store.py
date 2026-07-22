@@ -1,25 +1,30 @@
-"""Local document dedupe, text chunking, and Chroma vector retrieval."""
+"""Local document dedupe, LangChain chunking, and Chroma vector retrieval."""
 
 from __future__ import annotations
 
 import hashlib
 import html
 import json
-import math
+import os
 import re
 import shutil
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO
+
+from stock_screener_filter.config import load_env
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STORE_DIR = PROJECT_ROOT / "data" / "document_store"
 RAW_DIR = STORE_DIR / "raw"
 CHROMA_DIR = PROJECT_ROOT / "data" / "chroma_db"
+MODEL_CACHE_DIR = PROJECT_ROOT / "data" / "model_cache"
 DOCUMENTS_PATH = STORE_DIR / "documents.json"
-TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_&.-]{1,}")
-EMBEDDING_DIMENSIONS = 384
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+DEFAULT_CHUNK_SIZE = 2500
+DEFAULT_CHUNK_OVERLAP = 350
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,7 @@ class StoredDocument:
 def ensure_dirs() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     STORE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -105,6 +111,11 @@ def save_upload(stock_id: str, company_name: str, filename: str, source: BinaryI
         "stored_path": str(stored_path.relative_to(PROJECT_ROOT)),
         "text_chars": len(text),
         "chunk_count": len(chunks),
+        "embedding_model": embedding_model_name(),
+        "embedding_dimensions": embedding_dimensions(),
+        "chunker": "RecursiveCharacterTextSplitter",
+        "chunk_size": chunk_size(),
+        "chunk_overlap": chunk_overlap(),
         "note": note,
     }
     save_document_index(index)
@@ -149,22 +160,35 @@ def extract_pdf_text(path: Path) -> tuple[str, str]:
     return "\n\n".join(pages), ""
 
 
-def chunk_text(text: str, chunk_words: int = 450, overlap_words: int = 80) -> list[str]:
-    words = text.split()
-    if not words:
+def chunk_size() -> int:
+    load_env()
+    return int(os.environ.get("RAG_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
+
+
+def chunk_overlap() -> int:
+    load_env()
+    return int(os.environ.get("RAG_CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP)))
+
+
+def chunk_text(text: str) -> list[str]:
+    cleaned = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+    if not cleaned:
         return []
-    chunks: list[str] = []
-    step = max(1, chunk_words - overlap_words)
-    for start in range(0, len(words), step):
-        chunk = " ".join(words[start : start + chunk_words]).strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError as exc:
+        raise RuntimeError("LangChain text splitters are not installed. Run: python -m pip install -r requirements.txt") from exc
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size(),
+        chunk_overlap=chunk_overlap(),
+        separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
+        length_function=len,
+    )
+    return [chunk.strip() for chunk in splitter.split_text(cleaned) if chunk.strip()]
 
 
 def chroma_client() -> object:
-    import os
-
     os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
     try:
         import chromadb
@@ -179,32 +203,83 @@ def chroma_client() -> object:
 
 
 def collection_name(stock_id: str) -> str:
-    digest = hashlib.sha256(stock_id.encode("utf-8")).hexdigest()[:24]
-    return f"stock-{digest}"
+    stock_digest = hashlib.sha256(stock_id.encode("utf-8")).hexdigest()[:16]
+    return f"stock-bge-m3-{stock_digest}"
 
 
 def stock_collection(stock_id: str) -> object:
     return chroma_client().get_or_create_collection(
         name=collection_name(stock_id),
-        metadata={"hnsw:space": "cosine", "stock_id": stock_id},
+        metadata={
+            "hnsw:space": "cosine",
+            "stock_id": stock_id,
+            "embedding_model": embedding_model_name(),
+        },
     )
 
 
-def tokenize(text: str) -> list[str]:
-    return [token.lower() for token in TOKEN_RE.findall(text)]
+def embedding_model_name() -> str:
+    return DEFAULT_EMBEDDING_MODEL
+
+
+def embedding_cache_exists() -> bool:
+    model_cache_name = f"models--{embedding_model_name().replace('/', '--')}"
+    return (MODEL_CACHE_DIR / model_cache_name).exists()
+
+
+def embedding_local_files_only() -> bool:
+    load_env()
+    configured = os.environ.get("EMBEDDING_LOCAL_FILES_ONLY")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return embedding_cache_exists()
+
+
+@lru_cache(maxsize=1)
+def embedding_model() -> object:
+    load_env()
+    os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR))
+    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(MODEL_CACHE_DIR))
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    local_files_only = embedding_local_files_only()
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError("sentence-transformers is not installed. Run: python -m pip install -r requirements.txt") from exc
+
+    device = os.environ.get("EMBEDDING_DEVICE") or None
+    return SentenceTransformer(
+        embedding_model_name(),
+        cache_folder=str(MODEL_CACHE_DIR),
+        device=device,
+        local_files_only=local_files_only,
+    )
+
+
+def embedding_dimensions() -> int:
+    dimensions = embedding_model().get_sentence_embedding_dimension()
+    return int(dimensions or 0)
+
+
+def embedding_batch_size() -> int:
+    load_env()
+    return int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
+
+
+def embeddings(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    encoded = embedding_model().encode(
+        texts,
+        batch_size=embedding_batch_size(),
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return [vector.tolist() for vector in encoded]
 
 
 def embedding(text: str) -> list[float]:
-    vector = [0.0] * EMBEDDING_DIMENSIONS
-    for token in tokenize(text):
-        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        index = int.from_bytes(digest[:4], "big") % EMBEDDING_DIMENSIONS
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vector[index] += sign
-    norm = math.sqrt(sum(value * value for value in vector))
-    if not norm:
-        return vector
-    return [value / norm for value in vector]
+    return embeddings([text])[0]
 
 
 def write_chunks(stock_id: str, document_sha: str, filename: str, chunks: list[str]) -> None:
@@ -218,6 +293,7 @@ def write_chunks(stock_id: str, document_sha: str, filename: str, chunks: list[s
             "document_sha": document_sha,
             "filename": filename,
             "chunk_index": index,
+            "embedding_model": embedding_model_name(),
         }
         for index in range(1, len(chunks) + 1)
     ]
@@ -225,7 +301,7 @@ def write_chunks(stock_id: str, document_sha: str, filename: str, chunks: list[s
         ids=ids,
         documents=chunks,
         metadatas=metadatas,
-        embeddings=[embedding(chunk) for chunk in chunks],
+        embeddings=embeddings(chunks),
     )
 
 

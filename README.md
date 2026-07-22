@@ -106,13 +106,7 @@ then runs screen crawling, profile crawling, HTML rules, Excel downloads, Excel
 rules, and the final >=65% rule filter. Older timestamped folders under
 `data/runs/` are left alone.
 
-For AI/RAG evaluation, set a Gemini key in the terminal:
-
-```powershell
-$env:GEMINI_API_KEY = "your-key"
-```
-
-Or create a local `.env` file from `.env.example`:
+For AI/RAG evaluation, create a local `.env` file from `.env.example`:
 
 ```powershell
 Copy-Item .env.example .env
@@ -121,6 +115,24 @@ notepad .env
 
 `.env` is gitignored. The UI reads Gemini credentials only from `.env` or the
 server environment. Uploaded documents are deduplicated by SHA-256 per stock under
-`data/document_store/`. Extracted chunks are stored in ChromaDB under
-`data/chroma_db/`, with a separate collection per stock. AI results are saved
-under `data/ai_evaluations/`.
+`data/document_store/`.
+
+The RAG layer uses LangChain's recursive text splitter, local
+`sentence-transformers` embeddings, and ChromaDB. By default the embedding model
+is fixed to `BAAI/bge-m3`, downloaded into `data/model_cache/` on first use.
+Extracted chunks are stored in ChromaDB under `data/chroma_db/`, with a separate
+collection per stock. AI evaluation is orchestrated as a question-by-question
+LangGraph workflow:
+
+```text
+future outlook -> initiatives -> promise delivery -> exaggeration risk
+-> news sentiment -> industry outlook -> final scoring
+```
+
+The first four questions retrieve focused chunks from Chroma. The news and
+industry questions fetch DuckDuckGo snippets with `ddgs`, cache those search
+results under `data/search_cache/`, and pass the snippets/URLs to Gemini as
+source context. The final node combines the sub-answers into the 50-point AI
+score.
+
+AI results are saved under `data/ai_evaluations/`.
