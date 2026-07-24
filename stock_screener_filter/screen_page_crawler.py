@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
 
+from stock_screener_filter.config import load_env
 from stock_screener_filter.screener_login import (
     DEFAULT_BROWSER_CHANNEL,
     DEFAULT_PROFILE_DIR,
@@ -25,6 +28,12 @@ DEFAULT_SCREEN_URLS = (
 )
 
 
+def screen_urls_from_env() -> list[str]:
+    load_env()
+    raw = os.environ.get("SCREENER_SCREEN_URLS", "")
+    return [item.strip() for item in re.split(r"[\n,;]+", raw) if item.strip()]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Save the HTML of every page in one or more Screener screens."
@@ -32,8 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--screens",
         nargs="+",
-        default=list(DEFAULT_SCREEN_URLS),
-        help="One or more Screener screen URLs.",
+        default=None,
+        help=(
+            "One or more Screener screen URLs. Defaults to SCREENER_SCREEN_URLS "
+            "from .env, then the built-in sample screens."
+        ),
     )
     parser.add_argument(
         "--profile-dir",
@@ -63,6 +75,17 @@ def parse_args() -> argparse.Namespace:
         help="Show the browser while crawling.",
     )
     return parser.parse_args()
+
+
+def configured_screen_urls(cli_screens: list[str] | None = None) -> list[str]:
+    if cli_screens:
+        return cli_screens
+
+    env_screens = screen_urls_from_env()
+    if env_screens:
+        return env_screens
+
+    return list(DEFAULT_SCREEN_URLS)
 
 
 def screen_id(screen_url: str) -> str:
@@ -192,7 +215,7 @@ def main() -> int:
     try:
         page = context.pages[0] if context.pages else context.new_page()
         manifest: list[dict[str, Any]] = []
-        for screen_url in args.screens:
+        for screen_url in configured_screen_urls(args.screens):
             manifest.extend(crawl_screen(page, screen_url, run_dir, args.delay_seconds))
 
         manifest_path = run_dir / "manifest.json"

@@ -29,6 +29,86 @@ If you prefer Chrome:
 python -m stock_screener_filter.screener_login --browser-channel chrome
 ```
 
+## Screener Setup
+
+The HTML rule scraper depends on Screener's company profile quick-ratio section.
+Configure your Screener company profile so the quick-ratio card matches this
+format before scraping:
+
+![Required Screener company profile quick-ratio format](<docs/images/Screenshot 2026-07-24 053742.png>)
+
+At minimum, these ratios must be visible with these names:
+
+```text
+Stock P/E
+Industry PE
+3Yrs PE
+5Yrs PE
+7Yrs PE
+ROCE
+ROE
+Debt to equity
+DPR YOY
+Pledged percentage
+Promoter holding
+```
+
+The project also reads sales, profit growth, stock price CAGR, and promoter
+holding from the standard Screener company profile sections. It is designed for
+non-financial operating companies and should not be used for banks, NBFCs,
+financial services firms, insurers, or similar financial companies. Those
+companies have different balance-sheet and cash-flow economics, so the rules are
+not comparable.
+
+Add this custom ratio in Screener before running the pipeline:
+
+```text
+Ratio name: DPR YOY
+Short name: DPR YOY
+Ratio unit: Percentage
+Formula: ((Depreciation -Depreciation last year)/Depreciation last year)*100
+Description: Depreciation -Depreciation last year
+```
+
+The current default screens use these Screener queries:
+
+```text
+Market cap to profit <10
+AND
+Market cap to profit >0
+AND
+Market Capitalization >5000
+```
+
+```text
+Return over 5years <Profit growth 5Years
+AND
+Market Capitalization >5000
+```
+
+```text
+DPR YOY >0
+AND
+
+Market Capitalization >5000
+
+AND
+Depreciation >100
+```
+
+You can use your own Screener screens. Put their links in `.env` as a
+comma-separated list:
+
+```text
+SCREENER_SCREEN_URLS=https://www.screener.in/screens/your-first-screen/,https://www.screener.in/screens/your-second-screen/
+```
+
+You can also pass screen links for one command-line run:
+
+```powershell
+python -m stock_screener_filter.screen_page_crawler --screens https://www.screener.in/screens/your-first-screen/ https://www.screener.in/screens/your-second-screen/
+```
+
 ## Screen HTML Download
 
 After signing in, download every paginated page of the configured screens:
