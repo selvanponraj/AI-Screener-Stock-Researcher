@@ -121,6 +121,7 @@ def run_command(args: list[str], log: Callable[[str], None]) -> None:
 
 def pipeline_commands(paths: PipelinePaths) -> list[tuple[str, list[str]]]:
     return [
+        login_command(),
         (
             "Download Screener screen pages",
             [
@@ -192,22 +193,26 @@ def pipeline_commands(paths: PipelinePaths) -> list[tuple[str, list[str]]]:
     ]
 
 
+def login_command() -> tuple[str, list[str]]:
+    return (
+        "Login / verify Screener session",
+        [
+            sys.executable,
+            "-m",
+            "stock_screener_filter.screener_login",
+            "--url",
+            "https://www.screener.in/",
+            "--manual",
+            "--timeout-seconds",
+            "300",
+        ],
+    )
+
+
 def step_command(step_id: str, paths: PipelinePaths) -> tuple[str, list[str]]:
     commands = {
-        "login": (
-            "Login / verify Screener session",
-            [
-                sys.executable,
-                "-m",
-                "stock_screener_filter.screener_login",
-                "--url",
-                "https://www.screener.in/",
-                "--manual",
-                "--timeout-seconds",
-                "180",
-            ],
-        ),
-        "screens": pipeline_commands(paths)[0],
+        "login": login_command(),
+        "screens": pipeline_commands(paths)[1],
         "profiles": (
             "Download company profile HTML",
             [
@@ -225,7 +230,7 @@ def step_command(step_id: str, paths: PipelinePaths) -> tuple[str, list[str]]:
                 "--resume",
             ],
         ),
-        "html_rules": pipeline_commands(paths)[2],
+        "html_rules": pipeline_commands(paths)[3],
         "excel_downloads": (
             "Download Screener Excel exports",
             [
@@ -243,7 +248,7 @@ def step_command(step_id: str, paths: PipelinePaths) -> tuple[str, list[str]]:
                 "--resume",
             ],
         ),
-        "excel_rules": pipeline_commands(paths)[4],
+        "excel_rules": pipeline_commands(paths)[5],
     }
     if step_id not in commands:
         raise ValueError(f"Unknown pipeline step: {step_id}")

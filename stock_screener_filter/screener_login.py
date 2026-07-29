@@ -30,7 +30,10 @@ LOGGED_IN_SELECTORS = (
     "button:has-text('Logout')",
     "text=Logout",
     "a[href*='/user/']",
-    "a[href*='/account']",
+    "a[href*='/user/account/']",
+    "a[href*='/watchlist']",
+    "a[href*='/alerts/']",
+    "a[href*='/notebook/']",
 )
 
 
@@ -95,6 +98,16 @@ def first_visible(page: Page, selectors: Iterable[str]) -> Optional[str]:
     return None
 
 
+def first_present(page: Page, selectors: Iterable[str]) -> Optional[str]:
+    for selector in selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return selector
+        except (Error, TimeoutError):
+            continue
+    return None
+
+
 def looks_logged_in(page: Page) -> bool:
     parsed_url = urlparse(page.url)
     host = parsed_url.netloc.lower()
@@ -103,13 +116,16 @@ def looks_logged_in(page: Page) -> bool:
     if not (host == "screener.in" or host.endswith(".screener.in")):
         return False
 
-    if first_visible(page, LOGGED_IN_SELECTORS):
+    if first_present(page, LOGGED_IN_SELECTORS):
         return True
 
-    if "/login" in path:
-        return False
+    return False
 
-    return first_visible(page, LOGIN_SELECTORS) is None
+
+def verify_logged_in_session(page: Page, url: str = DEFAULT_URL) -> bool:
+    page.goto(url, wait_until="domcontentloaded")
+    page.wait_for_timeout(1_000)
+    return looks_logged_in(page)
 
 
 def get_credentials(args: argparse.Namespace) -> tuple[str, str]:

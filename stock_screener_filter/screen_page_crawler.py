@@ -18,6 +18,7 @@ from stock_screener_filter.config import load_env
 from stock_screener_filter.screener_login import (
     DEFAULT_BROWSER_CHANNEL,
     DEFAULT_PROFILE_DIR,
+    verify_logged_in_session,
 )
 
 
@@ -210,6 +211,8 @@ def main() -> int:
 
     try:
         page = context.pages[0] if context.pages else context.new_page()
+        if not verify_logged_in_session(page):
+            raise RuntimeError("Screener profile is not logged in. Run the login helper first.")
         manifest: list[dict[str, Any]] = []
         for screen_url in configured_screen_urls(args.screens):
             manifest.extend(crawl_screen(page, screen_url, run_dir, args.delay_seconds))

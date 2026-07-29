@@ -119,7 +119,7 @@ def run_pipeline_background() -> None:
         STATE.error_trace = None
         STATE.logs = []
         STATE.progress_current = 0
-        STATE.progress_total = 6
+        STATE.progress_total = 7
         STATE.current_step = "Starting"
     try:
         stocks = rules_pipeline.run_full_pipeline(STATE.log, progress=STATE.progress)

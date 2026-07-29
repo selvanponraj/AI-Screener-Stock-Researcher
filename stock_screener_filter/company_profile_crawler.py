@@ -19,6 +19,7 @@ from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
 from stock_screener_filter.screener_login import (
     DEFAULT_BROWSER_CHANNEL,
     DEFAULT_PROFILE_DIR,
+    verify_logged_in_session,
 )
 
 
@@ -123,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Retry transient HTTP/browser failures per company. Default: 2.",
     )
+    parser.add_argument(
+        "--allow-missing-quick-ratios",
+        action="store_true",
+        help="Save profile HTML even if the configured quick-ratio labels are missing.",
+    )
     return parser.parse_args()
 
 
@@ -155,17 +161,38 @@ def company_filename(company_url: str) -> str:
     return f"{safe_identifier}_{suffix}.html"
 
 
-def wait_for_quick_ratios(page: Page, timeout_seconds: float) -> bool:
+def visible_ratio_labels(page: Page) -> set[str]:
+    selectors = (
+        "li[data-source='quick-ratio'] span.name",
+        "#top-ratios span.name",
+        "ul#top-ratios span.name",
+        ".company-ratios span.name",
+        "span.name",
+    )
+    labels: set[str] = set()
+    for selector in selectors:
+        try:
+            labels.update(
+                " ".join(label.split())
+                for label in page.locator(selector).all_inner_texts()
+                if label.strip()
+            )
+        except (Error, TimeoutError):
+            continue
+    return labels
+
+
+def wait_for_quick_ratios(page: Page, timeout_seconds: float) -> tuple[bool, list[str], list[str]]:
     deadline = time.monotonic() + timeout_seconds
+    labels: set[str] = set()
     while time.monotonic() < deadline:
-        labels = {
-            " ".join(label.split())
-            for label in page.locator("li[data-source='quick-ratio'] span.name").all_inner_texts()
-        }
-        if all(label in labels for label in REQUIRED_QUICK_RATIO_LABELS):
-            return True
+        labels = visible_ratio_labels(page)
+        missing = [label for label in REQUIRED_QUICK_RATIO_LABELS if label not in labels]
+        if not missing:
+            return True, sorted(labels), []
         page.wait_for_timeout(250)
-    return False
+    missing = [label for label in REQUIRED_QUICK_RATIO_LABELS if label not in labels]
+    return False, sorted(labels), missing
 
 
 def download_profile(
@@ -173,6 +200,7 @@ def download_profile(
     company_url: str,
     html_path: Path,
     quick_ratio_wait_seconds: float,
+    allow_missing_quick_ratios: bool,
 ) -> dict[str, Any]:
     response = page.goto(company_url, wait_until="domcontentloaded")
 
@@ -184,10 +212,10 @@ def download_profile(
     if response and response.status >= 400:
         raise RuntimeError(f"Screener returned HTTP {response.status}.")
 
-    quick_ratios_ready = wait_for_quick_ratios(page, quick_ratio_wait_seconds)
+    quick_ratios_ready, visible_labels, missing_labels = wait_for_quick_ratios(page, quick_ratio_wait_seconds)
     if not page.locator("section#profit-loss").count():
         raise RequestRejectedError("Screener returned an interstitial instead of a company profile.")
-    if not quick_ratios_ready:
+    if not allow_missing_quick_ratios and not quick_ratios_ready:
         raise IncompleteProfileError("Required quick-ratio labels did not load before the timeout.")
 
     page.wait_for_timeout(250)
@@ -199,6 +227,14 @@ def download_profile(
         "title": page.title(),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "quick_ratios_ready": quick_ratios_ready,
+        "visible_ratio_labels": visible_labels,
+        "missing_quick_ratio_labels": missing_labels,
+        "warning": (
+            "Required quick-ratio labels missing. Check the Screener company profile configuration "
+            "for the browser profile used by this crawler."
+            if missing_labels
+            else ""
+        ),
     }
 
 
@@ -207,6 +243,7 @@ def download_profile_with_retries(
     company_url: str,
     html_path: Path,
     quick_ratio_wait_seconds: float,
+    allow_missing_quick_ratios: bool,
     max_retries: int,
     retry_delay_seconds: float,
 ) -> dict[str, Any]:
@@ -214,7 +251,7 @@ def download_profile_with_retries(
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            return download_profile(page, company_url, html_path, quick_ratio_wait_seconds)
+            return download_profile(page, company_url, html_path, quick_ratio_wait_seconds, allow_missing_quick_ratios)
         except RequestRejectedError:
             raise
         except (Error, TimeoutError, RuntimeError) as exc:
@@ -320,6 +357,8 @@ def main() -> int:
 
     try:
         page = context.pages[0] if context.pages else context.new_page()
+        if not verify_logged_in_session(page):
+            raise RuntimeError("Screener profile is not logged in. Run the login helper first.")
 
         for index, company_url in enumerate(pending_urls, start=1):
             html_path = html_dir / company_filename(company_url)
@@ -333,10 +372,18 @@ def main() -> int:
                     company_url,
                     html_path,
                     args.quick_ratio_wait_seconds,
+                    args.allow_missing_quick_ratios,
                     args.max_retries,
                     args.delay_seconds,
                 )
                 record: dict[str, Any] = {"company_url": company_url, **metadata}
+                if metadata.get("missing_quick_ratio_labels"):
+                    print(
+                        f"Warning {company_url}: missing quick-ratio labels: "
+                        f"{', '.join(metadata['missing_quick_ratio_labels'])}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except (Error, TimeoutError, RuntimeError) as exc:
                 record = {
                     "company_url": company_url,

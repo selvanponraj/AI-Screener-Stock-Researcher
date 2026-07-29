@@ -1,19 +1,17 @@
 # AI Stock Researcher
 
 AI Stock Researcher is a local research assistant for automating the stock
-screening workflow I used to do manually for investments. The goal is to start
-with rule-based filtering from Screener.in, narrow the universe to companies
-that pass quantitative checks, then use uploaded annual reports, concalls, and
-quarterly updates to judge whether management commentary is credible and whether
-the business outlook is attractive.
+screening workflow I used to do manually for investments. It starts with
+rule-based filtering from Screener.in, narrows the universe to companies that
+pass quantitative checks, and then uses uploaded annual reports, concalls, and
+quarterly reports to judge management commentary, execution quality, and
+business outlook.
 
-The project is intentionally built as a local-first tool. It keeps Screener
-HTML, Excel exports, uploaded documents, vector indexes, and AI evaluations on
-your machine.
+The project is local-first. Screener HTML, Excel exports, uploaded documents,
+Chroma vector indexes, model cache files, and AI evaluations stay on your
+machine under `data/`. Secrets stay in `.env`, which is gitignored.
 
-## Architecture
-
-The system is an ETL plus RAG pipeline:
+## What This App Does
 
 ```text
 Screener screens
@@ -25,138 +23,149 @@ Screener screens
 -> >=75% rule-filtered stocks
 -> document upload per stock
 -> Chroma vector store
--> question-by-question AI evaluation
+-> document Q&A and AI evaluation
 -> final score out of 100
 ```
 
-The local app UI is served by `stock_screener_filter.app_server`. It starts
-background pipeline steps, tracks logs/progress, shows rule details for each
-stock, accepts document uploads, and triggers AI evaluation.
+The final quantitative filter currently requires at least 75% of the 13 rules,
+which means a company must pass at least 10 out of 13 rules.
 
-Core components:
+This method is designed for non-financial operating companies. Do not use the
+rule output for banks, NBFCs, insurance companies, financial-services firms, or
+similar financial businesses. Their balance-sheet, debt, cash-flow, and return
+metrics are not comparable to normal operating companies.
 
-```text
-stock_screener_filter/screener_login.py
+## Prerequisites
+
+Install these before running the project:
+
+- Python 3.9 or newer
+- Git
+- Microsoft Edge or Google Chrome
+- A Screener.in account
+- A Gemini API key for AI/RAG evaluation
+
+The scraper uses Playwright. By default this repo uses Microsoft Edge because it
+has worked reliably with Screener login in this project. Other users can switch
+to Chrome or Playwright Chromium by changing the browser channel.
+
+## Fresh Setup
+
+Clone the repository:
+
+```bash
+git clone https://github.com/arakshay60/AI-Screener-Stock-Researcher.git
+cd AI-Screener-Stock-Researcher
 ```
 
-Opens a persistent Playwright browser profile and verifies Screener login. The
-saved browser profile is reused by crawlers so you do not need to log in for
-every request.
+Create a virtual environment.
 
-```text
-stock_screener_filter/screen_page_crawler.py
-```
-
-Visits the configured Screener screen URLs, follows pagination, and saves each
-rendered screen page HTML.
-
-```text
-stock_screener_filter/company_profile_crawler.py
-```
-
-Extracts company links from the screen pages, visits every company profile, and
-saves the full rendered HTML with a delay between requests.
-
-```text
-stock_screener_filter/company_rule_analyzer.py
-```
-
-Parses the downloaded company profile HTML and evaluates the first 11 rules,
-excluding banks, financial services, NBFCs, insurers, and similar companies.
-
-```text
-stock_screener_filter/company_excel_crawler.py
-```
-
-Downloads Screener Excel exports only for companies that pass enough of the HTML
-rules.
-
-```text
-stock_screener_filter/company_excel_rule_analyzer.py
-```
-
-Reads the Excel exports and evaluates the SSGR and CFO/EBITDA rules.
-
-```text
-stock_screener_filter/rules_pipeline.py
-```
-
-Coordinates the ETL steps, cleans `data/current_run/` for fresh full runs, and
-combines the HTML and Excel rule outputs into the final rule-filtered stock
-list.
-
-```text
-stock_screener_filter/document_store.py
-```
-
-Deduplicates uploaded documents by SHA-256, extracts text, chunks it, embeds it
-with local `BAAI/bge-m3`, and stores vectors in ChromaDB.
-
-```text
-stock_screener_filter/ai_evaluator.py
-```
-
-Runs the qualitative RAG evaluation. It retrieves focused evidence for each
-question, uses DuckDuckGo snippets for news and industry context, calls Gemini
-for structured analysis, and assigns the AI score.
-
-Design decisions:
-
-- **Local first:** generated data stays under `data/`, and secrets stay in
-  `.env`.
-- **Idempotent current run:** the app cleans and recreates `data/current_run/`
-  for a fresh pipeline run, while old archived runs can remain under
-  `data/runs/`.
-- **Persistent browser login:** Screener auth is stored in `.browser/`, avoiding
-  repeated login prompts during scraping.
-- **Polite crawling:** crawlers use delays between requests to reduce timeout
-  and throttling risk.
-- **Rules before AI:** AI/RAG is only run after the quantitative filter, keeping
-  document work focused on better candidates.
-- **One stock, one vector collection:** uploaded documents are indexed separately
-  per stock so retrieval does not mix evidence across companies.
-- **Question-by-question RAG:** each qualitative question retrieves its own
-  relevant chunks instead of answering every question from one broad context.
-- **No financial firms:** banks, NBFCs, insurance, and financial-services
-  businesses are excluded because the valuation, debt, cash-flow, and return
-  rules are not comparable to normal operating companies.
-
-## Screener Login
-
-Install dependencies:
+Windows PowerShell:
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install Python dependencies:
+
+```bash
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Run the login helper:
+Install Playwright browser support:
 
-```powershell
-$env:SCREENER_EMAIL = "your-email@example.com"
-$env:SCREENER_PASSWORD = "your-password"
-python -m stock_screener_filter.screener_login --url https://www.screener.in/
+```bash
+python -m playwright install chromium
 ```
 
-The first run opens a real Microsoft Edge browser window and logs in using
-Screener's email/password form. The browser session is saved under
-`.browser/screener-profile-edge` and reused on future runs. Do not commit real
-credentials into this project.
+This installs Playwright's bundled Chromium. The project can still use Edge or
+Chrome if those browsers are already installed.
 
-If you prefer Chrome:
+Create your local `.env` file:
+
+Windows PowerShell:
 
 ```powershell
-python -m stock_screener_filter.screener_login --browser-channel chrome
+Copy-Item .env.example .env
+notepad .env
 ```
+
+macOS/Linux:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set at least:
+
+```env
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-flash-lite-latest
+STOCK_RESEARCHER_PORT=8765
+```
+
+Optional but recommended:
+
+```env
+SCREENER_SCREEN_URLS=https://www.screener.in/screens/your-first-screen/,https://www.screener.in/screens/your-second-screen/
+EMBEDDING_DEVICE=cpu
+EMBEDDING_BATCH_SIZE=16
+RAG_CHUNK_SIZE=2500
+RAG_CHUNK_OVERLAP=350
+DDG_RESULTS_PER_QUERY=5
+DDG_SEARCH_TIMEOUT_SECONDS=15
+```
+
+Do not commit `.env`. It is intentionally ignored by Git.
+
+## Browser Choice
+
+The default browser channel is currently:
+
+```text
+msedge
+```
+
+That means Playwright uses installed Microsoft Edge and stores the Screener
+session under:
+
+```text
+.browser/screener-profile-edge
+```
+
+If you want to use Chrome manually:
+
+```bash
+python -m stock_screener_filter.screener_login --browser-channel chrome --manual --keep-open
+```
+
+If you want to use Playwright's bundled Chromium:
+
+```bash
+python -m stock_screener_filter.screener_login --browser-channel chromium --manual --keep-open
+```
+
+If Screener login or custom ratios behave differently in one browser, use the
+browser where your Screener setup works reliably.
 
 ## Screener Setup
 
-The HTML rule scraper depends on Screener's company profile quick-ratio section.
-Configure your Screener company profile so the quick-ratio card matches this
-format before scraping:
+The scraper depends on Screener's company profile quick-ratio card. Configure
+your Screener company profile so the quick-ratio section matches this format:
 
 ![Required Screener company profile quick-ratio format](<docs/images/Screenshot 2026-07-24 053742.png>)
 
-At minimum, these ratios must be visible with these names:
+At minimum, these ratios must be visible with these exact names:
 
 ```text
 Stock P/E
@@ -172,14 +181,7 @@ Pledged percentage
 Promoter holding
 ```
 
-The project also reads sales, profit growth, stock price CAGR, and promoter
-holding from the standard Screener company profile sections. It is designed for
-non-financial operating companies and should not be used for banks, NBFCs,
-financial services firms, insurers, or similar financial companies. Those
-companies have different balance-sheet and cash-flow economics, so the rules are
-not comparable.
-
-Add this custom ratio in Screener before running the pipeline:
+Add this custom ratio in Screener:
 
 ```text
 Ratio name: DPR YOY
@@ -189,7 +191,24 @@ Formula: ((Depreciation -Depreciation last year)/Depreciation last year)*100
 Description: Depreciation -Depreciation last year
 ```
 
-The current default screens use these Screener queries:
+Important: configure this in the same browser profile used by the scraper. The
+easiest way is:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --keep-open
+```
+
+In the opened browser window:
+
+1. Log in to Screener.
+2. Open any company page.
+3. Configure the quick-ratio card.
+4. Confirm the required labels are visible.
+5. Press `Ctrl+C` in the terminal when done.
+
+## Screener Screens
+
+The default screens use these Screener queries:
 
 ```text
 Market cap to profit <10
@@ -215,123 +234,393 @@ AND
 Depreciation >100
 ```
 
-You can use your own Screener screens. Put their links in `.env` as a
-comma-separated list:
+You can use your own Screener screens. Put the screen links in `.env`:
 
-```text
+```env
 SCREENER_SCREEN_URLS=https://www.screener.in/screens/your-first-screen/,https://www.screener.in/screens/your-second-screen/
 ```
 
-You can also pass screen links for one command-line run:
+You can also pass screen links directly for a one-off command:
 
-```powershell
+```bash
 python -m stock_screener_filter.screen_page_crawler --screens https://www.screener.in/screens/your-first-screen/ https://www.screener.in/screens/your-second-screen/
 ```
 
-## Screen HTML Download
+## Run The App
 
-After signing in, download every paginated page of the configured screens:
+Start the local web UI:
 
-```powershell
-python -m stock_screener_filter.screen_page_crawler
-```
-
-Each run saves full rendered HTML and a `manifest.json` under
-`data/runs/<timestamp>/screens/`.
-
-## Company Profile HTML Download
-
-Download the full profile HTML for every unique company linked by the latest
-screen run. Requests are made one at a time with a 1.5-second pause:
-
-```powershell
-python -m stock_screener_filter.company_profile_crawler
-```
-
-Use `--dry-run` to report the number of unique company profiles before making
-any requests.
-
-If a run is interrupted, resume it without re-fetching profiles that were
-already saved:
-
-```powershell
-python -m stock_screener_filter.company_profile_crawler --output-dir data/runs/20260624_company_profiles/companies --resume
-```
-
-The profile crawler waits for the configured Screener quick-ratio labels before
-saving each document. To test one profile without reading a screen page:
-
-```powershell
-python -m stock_screener_filter.company_profile_crawler --company-urls https://www.screener.in/company/ALEMBICLTD/consolidated/
-```
-
-## Rule Analysis
-
-Evaluate the downloaded company profiles against the screening rules without
-making any additional web requests:
-
-```powershell
-python -m stock_screener_filter.company_rule_analyzer
-```
-
-The analysis CSV and JSON are written under
-`data/runs/20260624_company_profiles/companies/analysis/`.
-
-Companies classified by Screener's local market taxonomy as financial services,
-banks, NBFCs, or insurers are excluded from the final eligibility field.
-
-## Excel Rules
-
-Download Screener's Excel export for non-financial companies with at least six
-prior rule passes, then evaluate SSGR and five-year CFO/EBITDA:
-
-```powershell
-python -m stock_screener_filter.company_excel_crawler
-python -m stock_screener_filter.company_excel_rule_analyzer
-```
-
-## Local App UI
-
-Start the browser UI:
-
-```powershell
+```bash
 python -m stock_screener_filter.app_server
 ```
 
-Open `http://127.0.0.1:8765`.
+Or use the cross-platform launcher:
 
-The **Run Screener Pipeline** button cleans and recreates `data/current_run/`,
-then runs screen crawling, profile crawling, HTML rules, Excel downloads, Excel
-rules, and the final >=75% rule filter. Older timestamped folders under
-`data/runs/` are left alone.
+```bash
+python run_app.py
+```
 
-For AI/RAG evaluation, create a local `.env` file from `.env.example`:
+Windows users can also use:
 
 ```powershell
-Copy-Item .env.example .env
-notepad .env
+.\run_app.ps1
 ```
 
-`.env` is gitignored. The UI reads Gemini credentials only from `.env` or the
-server environment. Uploaded documents are deduplicated by SHA-256 per stock under
-`data/document_store/`.
-
-The RAG layer uses LangChain's recursive text splitter, local
-`sentence-transformers` embeddings, and ChromaDB. By default the embedding model
-is fixed to `BAAI/bge-m3`, downloaded into `data/model_cache/` on first use.
-Extracted chunks are stored in ChromaDB under `data/chroma_db/`, with a separate
-collection per stock. AI evaluation is orchestrated as a question-by-question
-LangGraph workflow:
+Open:
 
 ```text
-future outlook -> initiatives -> promise delivery -> exaggeration risk
--> news sentiment -> industry outlook -> final scoring
+http://127.0.0.1:8765
 ```
 
-The first four questions retrieve focused chunks from Chroma. The news and
-industry questions fetch DuckDuckGo snippets with `ddgs`, cache those search
-results under `data/search_cache/`, and pass the snippets/URLs to Gemini as
-source context. The final node combines the sub-answers into the 50-point AI
-score.
+Click **Run Screener Pipeline**.
 
-AI results are saved under `data/ai_evaluations/`.
+The app will:
+
+1. Clean and recreate `data/current_run/`.
+2. Verify Screener login.
+3. If not logged in, open the browser and wait for you to log in.
+4. Download configured Screener screen pages.
+5. Download company profile HTML.
+6. Run the first 11 HTML rules.
+7. Download Screener Excel exports for eligible companies.
+8. Run the 2 Excel rules.
+9. Save final stocks that pass the >=75% rule filter.
+
+The crawler runs headlessly after login, so you usually will not see a browser
+window during scraping. This is normal. The saved browser profile still carries
+your Screener session cookies.
+
+To stop the app server, return to the terminal and press:
+
+```text
+Ctrl+C
+```
+
+## Running Pipeline Steps Manually
+
+The UI has individual step buttons, but you can also run commands yourself.
+
+Verify/login to Screener:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --keep-open
+```
+
+Download screen pages:
+
+```bash
+python -m stock_screener_filter.screen_page_crawler --output-dir data/current_run/screens --delay-seconds 3
+```
+
+Download company profiles:
+
+```bash
+python -m stock_screener_filter.company_profile_crawler --screen-dir data/current_run/screens --output-dir data/current_run/companies --delay-seconds 5 --quick-ratio-wait-seconds 8 --resume
+```
+
+Run HTML rules:
+
+```bash
+python -m stock_screener_filter.company_rule_analyzer --company-dir data/current_run/companies --output-dir data/current_run/companies/analysis
+```
+
+Download Excel exports:
+
+```bash
+python -m stock_screener_filter.company_excel_crawler --analysis-csv data/current_run/companies/analysis/company_rule_results.csv --output-dir data/current_run/companies/excel --min-passing-rules 6 --delay-seconds 10 --resume
+```
+
+Run Excel rules:
+
+```bash
+python -m stock_screener_filter.company_excel_rule_analyzer --excel-dir data/current_run/companies/excel --output-dir data/current_run/companies/excel/analysis
+```
+
+On Windows PowerShell, quote paths if they contain spaces:
+
+```powershell
+python -m stock_screener_filter.company_profile_crawler --screen-dir "C:\path with spaces\data\current_run\screens" --output-dir "C:\path with spaces\data\current_run\companies"
+```
+
+## Documents, RAG, And AI Evaluation
+
+After the quantitative pipeline finishes, the UI shows the stocks that passed
+the rule filter.
+
+For each stock, you can upload:
+
+- Annual reports
+- Concall transcripts
+- Quarterly reports
+- Text, HTML, CSV, JSON, or PDF files
+
+During upload, the app:
+
+1. Calculates a SHA-256 hash to deduplicate documents per stock.
+2. Extracts text.
+3. Chunks the document.
+4. Creates embeddings using local `BAAI/bge-m3`.
+5. Stores vectors in ChromaDB under `data/chroma_db/`.
+
+For PDFs, chunks preserve page ranges:
+
+```text
+page_start=14
+page_end=15
+pages=14,15
+```
+
+So answers can cite:
+
+```text
+Annual Report FY25, pp. 14-15
+```
+
+When uploading, you can optionally enter:
+
+- Year
+- Quarter
+
+Annual reports usually only need year. Quarterly reports can use year and
+quarter. These metadata fields can later be used as filters when asking
+questions.
+
+The **Ask Documents** box lets you ask custom questions against a stock's
+uploaded knowledge base. Answers are based only on retrieved document chunks and
+include citations.
+
+The **Evaluate** button runs the qualitative AI analysis for a stock. The
+question-by-question workflow is:
+
+```text
+future outlook
+-> initiatives
+-> promise delivery
+-> exaggeration risk
+-> news sentiment
+-> industry outlook
+-> final scoring
+```
+
+AI evaluations are cached by uploaded document fingerprint. If no new document
+has been uploaded for a stock, the app reuses the old AI evaluation instead of
+calling Gemini again.
+
+## Generated Data
+
+These folders are generated locally and ignored by Git:
+
+```text
+.browser/
+data/
+.env
+.venv/
+```
+
+Important generated locations:
+
+```text
+data/current_run/              latest pipeline run
+data/document_store/           uploaded document metadata and raw files
+data/chroma_db/                Chroma vector database
+data/model_cache/              downloaded BGE-M3 embedding model
+data/ai_evaluations/           saved AI outputs
+data/search_cache/             DuckDuckGo search cache
+```
+
+`data/current_run/` is cleaned on every full app pipeline run. Other generated
+folders are kept so uploaded documents, vectors, model files, and AI evaluations
+can be reused.
+
+## Architecture
+
+The local app UI is served by:
+
+```text
+stock_screener_filter/app_server.py
+```
+
+It starts background pipeline steps, tracks logs/progress, shows rule details,
+accepts document uploads, serves document Q&A, and triggers AI evaluation.
+
+Core components:
+
+```text
+stock_screener_filter/screener_login.py
+```
+
+Opens a persistent Playwright browser profile and verifies Screener login.
+
+```text
+stock_screener_filter/screen_page_crawler.py
+```
+
+Visits configured Screener screen URLs, follows pagination, and saves rendered
+screen HTML.
+
+```text
+stock_screener_filter/company_profile_crawler.py
+```
+
+Extracts company links from screen pages, visits each company profile, waits for
+required quick-ratio labels, and saves full rendered HTML.
+
+```text
+stock_screener_filter/company_rule_analyzer.py
+```
+
+Parses company profile HTML and evaluates the first 11 rules.
+
+```text
+stock_screener_filter/company_excel_crawler.py
+```
+
+Downloads Screener Excel exports for companies that pass enough HTML rules.
+
+```text
+stock_screener_filter/company_excel_rule_analyzer.py
+```
+
+Reads Excel files and evaluates SSGR and CFO/EBITDA rules.
+
+```text
+stock_screener_filter/rules_pipeline.py
+```
+
+Coordinates full and step-by-step ETL execution.
+
+```text
+stock_screener_filter/document_store.py
+```
+
+Deduplicates uploads, extracts text, chunks documents, creates BGE-M3
+embeddings, and stores vectors in ChromaDB.
+
+```text
+stock_screener_filter/ai_evaluator.py
+```
+
+Runs document Q&A and qualitative RAG evaluation with Gemini.
+
+Design decisions:
+
+- **Local first:** generated data stays on your machine.
+- **Persistent browser profile:** Screener login lives in `.browser/`.
+- **Login preflight:** the pipeline checks Screener login before crawling.
+- **Polite crawling:** requests run one at a time with delays.
+- **Rules before AI:** RAG is only used after quantitative filtering.
+- **Per-stock vector collections:** documents for one stock do not mix with
+  documents for another stock.
+- **Question-by-question RAG:** each qualitative question retrieves its own
+  evidence.
+- **Document fingerprint caching:** AI evaluations are reused until new
+  documents are uploaded.
+
+## Troubleshooting
+
+### The app says Screener is not logged in
+
+Run:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --keep-open
+```
+
+Log in in the opened browser. Then rerun the app pipeline.
+
+### Login completed but the app still waits
+
+Close the login browser and run the helper again:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --timeout-seconds 300
+```
+
+It should print:
+
+```text
+Already logged in to Screener.
+```
+
+### Required quick-ratio labels are missing
+
+Open the scraper browser profile:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --keep-open
+```
+
+In that browser, open a company profile and confirm the required ratios are
+visible. If they are missing, configure the Screener quick-ratio card again in
+that browser profile.
+
+### No browser appears while scraping
+
+That is normal. Crawlers run headlessly by default after login. To watch a
+manual crawler command, pass:
+
+```bash
+--headed
+```
+
+Example:
+
+```bash
+python -m stock_screener_filter.company_profile_crawler --screen-dir data/current_run/screens --output-dir data/current_run/companies --headed
+```
+
+### Screener is slow or starts timing out
+
+Increase delays:
+
+```bash
+--delay-seconds 8
+```
+
+Avoid rerunning large crawls repeatedly in a short period.
+
+### First document upload is slow
+
+The first RAG upload may download the `BAAI/bge-m3` embedding model into:
+
+```text
+data/model_cache/
+```
+
+After that, uploads reuse the local model cache.
+
+### Gemini errors
+
+Check `.env`:
+
+```env
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-flash-lite-latest
+```
+
+Restart the app after changing `.env`.
+
+### Port already in use
+
+Change the port in `.env`:
+
+```env
+STOCK_RESEARCHER_PORT=8766
+```
+
+Then restart:
+
+```bash
+python -m stock_screener_filter.app_server
+```
+
+## Validation
+
+To quickly check that Python files compile:
+
+```bash
+python -m compileall stock_screener_filter
+```
+
+This does not test Screener access, Gemini access, or document upload behavior,
+but it catches syntax/import issues.
