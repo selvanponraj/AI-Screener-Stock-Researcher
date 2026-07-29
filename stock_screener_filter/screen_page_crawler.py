@@ -28,12 +28,6 @@ DEFAULT_SCREEN_URLS = (
 )
 
 
-def screen_urls_from_env() -> list[str]:
-    load_env()
-    raw = os.environ.get("SCREENER_SCREEN_URLS", "")
-    return [item.strip() for item in re.split(r"[\n,;]+", raw) if item.strip()]
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Save the HTML of every page in one or more Screener screens."
@@ -81,7 +75,9 @@ def configured_screen_urls(cli_screens: list[str] | None = None) -> list[str]:
     if cli_screens:
         return cli_screens
 
-    env_screens = screen_urls_from_env()
+    load_env()
+    raw_screen_urls = os.environ.get("SCREENER_SCREEN_URLS", "")
+    env_screens = [item.strip() for item in re.split(r"[\n,;]+", raw_screen_urls) if item.strip()]
     if env_screens:
         return env_screens
 

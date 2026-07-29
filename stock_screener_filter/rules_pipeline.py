@@ -31,7 +31,8 @@ FIRST_STAGE_RULE_COLUMNS = (
 )
 EXCEL_RULE_COLUMNS = ("rule_12_ssgr", "rule_13_cfo_ebitda")
 TOTAL_RULES = len(FIRST_STAGE_RULE_COLUMNS) + len(EXCEL_RULE_COLUMNS)
-FINAL_RULE_PASS_THRESHOLD = math.ceil(TOTAL_RULES * 0.65)
+FINAL_RULE_PASS_PERCENTAGE = 75
+FINAL_RULE_PASS_THRESHOLD = math.ceil(TOTAL_RULES * FINAL_RULE_PASS_PERCENTAGE / 100)
 PIPELINE_STEPS = (
     "login",
     "screens",
@@ -414,7 +415,7 @@ def combine_rule_outputs(paths: PipelinePaths) -> list[dict[str, object]]:
                 "total_rule_count": TOTAL_RULES,
                 "rule_pass_percentage": round((total_passes / TOTAL_RULES) * 100, 2),
                 "rule_score_out_of_50": rule_score,
-                "passes_65_percent_filter": total_passes >= FINAL_RULE_PASS_THRESHOLD,
+                "passes_final_rule_filter": total_passes >= FINAL_RULE_PASS_THRESHOLD,
                 **{column: html_row.get(column, "") for column in FIRST_STAGE_RULE_COLUMNS},
                 **{column: excel_row.get(column, "") for column in EXCEL_RULE_COLUMNS},
                 "rule_details": build_rule_details(html_row, excel_row),
@@ -425,7 +426,7 @@ def combine_rule_outputs(paths: PipelinePaths) -> list[dict[str, object]]:
     paths.final_dir.mkdir(parents=True, exist_ok=True)
     json_path = paths.final_dir / "rule_filtered_stocks.json"
     csv_path = paths.final_dir / "rule_filtered_stocks.csv"
-    filtered = [row for row in combined if row["passes_65_percent_filter"]]
+    filtered = [row for row in combined if row["passes_final_rule_filter"]]
     json_path.write_text(json.dumps(filtered, indent=2), encoding="utf-8")
     if filtered:
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -528,7 +529,7 @@ def pipeline_status() -> list[dict[str, object]]:
             "id": "excel_rules",
             "label": "Excel rules",
             "complete": excel_rows > 0,
-            "summary": f"{excel_rows} Excel files analyzed; {len(filtered)} stocks pass >=65%",
+            "summary": f"{excel_rows} Excel files analyzed; {len(filtered)} stocks pass >={FINAL_RULE_PASS_PERCENTAGE}%",
         },
     ]
 
@@ -562,7 +563,10 @@ def run_full_pipeline(
     filtered = combine_rule_outputs(paths)
     if progress:
         progress(total_steps, total_steps, "Pipeline complete")
-    log(f"Saved final >=65% rule-filtered stocks: {paths.final_dir / 'rule_filtered_stocks.csv'}")
+    log(
+        f"Saved final >={FINAL_RULE_PASS_PERCENTAGE}% rule-filtered stocks: "
+        f"{paths.final_dir / 'rule_filtered_stocks.csv'}"
+    )
     log(f"Rule-filtered stock count: {len(filtered)}")
     return filtered
 

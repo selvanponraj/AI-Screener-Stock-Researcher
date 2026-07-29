@@ -182,8 +182,10 @@ def evaluate_background(stock_id: str | None) -> None:
     try:
         selected = [stock for stock in stocks if not stock_id or stock["stock_id"] == stock_id]
         for index, stock in enumerate(selected, start=1):
-            STATE.progress(index - 1, max(1, len(selected)), f"AI evaluating {stock['company_name']}")
-            STATE.log(f"[{index}/{len(selected)}] AI evaluating {stock['company_name']}")
+            current = ai_evaluator.current_evaluation(str(stock["stock_id"]))
+            action = "Using cached AI evaluation" if current else "AI evaluating"
+            STATE.progress(index - 1, max(1, len(selected)), f"{action} {stock['company_name']}")
+            STATE.log(f"[{index}/{len(selected)}] {action} {stock['company_name']}")
             ai_evaluator.evaluate_stock(stock)
         with STATE.lock:
             STATE.phase = "AI evaluation complete"
@@ -224,6 +226,8 @@ class Handler(BaseHTTPRequestHandler):
             self.upload_document()
         elif parsed.path == "/api/evaluate":
             self.start_evaluation()
+        elif parsed.path == "/api/ask":
+            self.ask_documents()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -278,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             stock_id = form.getfirst("stock_id", "")
             company_name = form.getfirst("company_name", "")
+            document_year = form.getfirst("document_year", "").strip()
+            document_quarter = form.getfirst("document_quarter", "").strip()
             if not stock_id or "file" not in form:
                 self.send_json({"ok": False, "error": "stock_id and file are required."}, status=400)
                 return
@@ -288,9 +294,48 @@ class Handler(BaseHTTPRequestHandler):
             for item in files:
                 if not item.filename:
                     continue
-                stored_doc = document_store.save_upload(stock_id, company_name, item.filename, item.file)
+                stored_doc = document_store.save_upload(
+                    stock_id,
+                    company_name,
+                    item.filename,
+                    item.file,
+                    document_year=document_year,
+                    document_quarter=document_quarter,
+                )
                 stored.append(stored_doc.__dict__)
             self.send_json({"ok": True, "documents": stored})
+        except Exception as exc:
+            trace = traceback.format_exc()
+            STATE.log(trace)
+            with STATE.lock:
+                STATE.error = str(exc)
+                STATE.error_trace = trace
+            self.send_json({"ok": False, "error": str(exc), "trace": trace}, status=500)
+
+    def ask_documents(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            stock_id = str(payload.get("stock_id", ""))
+            question = str(payload.get("question", ""))
+            document_year = str(payload.get("document_year", "")).strip()
+            document_quarter = str(payload.get("document_quarter", "")).strip()
+            if not stock_id or not question.strip():
+                self.send_json({"ok": False, "error": "stock_id and question are required."}, status=400)
+                return
+            with STATE.lock:
+                stocks = list(STATE.stocks) or rules_pipeline.load_current_rule_filtered()
+            stock = next((item for item in stocks if str(item.get("stock_id")) == stock_id), None)
+            if not stock:
+                self.send_json({"ok": False, "error": f"Unknown stock: {stock_id}"}, status=404)
+                return
+            answer = ai_evaluator.answer_document_question(
+                stock,
+                question,
+                document_year=document_year,
+                document_quarter=document_quarter,
+            )
+            self.send_json({"ok": True, "answer": answer})
         except Exception as exc:
             trace = traceback.format_exc()
             STATE.log(trace)
@@ -384,14 +429,15 @@ INDEX_HTML = r"""
       color: var(--accent);
     }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
-    input[type="password"], input[type="text"] {
+    input[type="password"], input[type="text"], input[type="number"], textarea, select {
       width: 100%;
-      height: 34px;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 0 10px;
+      padding: 8px 10px;
       background: #fff;
     }
+    input[type="password"], input[type="text"], input[type="number"], select { height: 34px; padding-top: 0; padding-bottom: 0; }
+    textarea { min-height: 64px; resize: vertical; font-family: inherit; }
     label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
     .step-list {
@@ -472,6 +518,17 @@ INDEX_HTML = r"""
     .warn { color: var(--warn); }
     .docs { margin-top: 8px; font-size: 12px; color: var(--muted); }
     .upload { display: grid; gap: 7px; min-width: 220px; }
+    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+    .qa-box { margin-top: 12px; display: grid; gap: 7px; min-width: 260px; }
+    .qa-answer {
+      margin-top: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfbf9;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
     .progress-shell {
       width: 100%;
       height: 12px;
@@ -568,7 +625,7 @@ INDEX_HTML = r"""
     </aside>
     <section>
       <div id="uploadPrompt" class="prompt">
-        Run the Screener pipeline. Once stocks pass the 65% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.
+        Run the Screener pipeline. Once stocks pass the 75% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.
       </div>
       <table>
         <thead>
@@ -586,6 +643,7 @@ INDEX_HTML = r"""
   </main>
   <script>
     let latest = {};
+    let qaAnswers = {};
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -649,8 +707,8 @@ INDEX_HTML = r"""
       );
       body.innerHTML = '';
       $('uploadPrompt').textContent = stocks.length
-        ? `Upload annual reports, concalls, or quarterly reports for the ${stocks.length} stocks that passed the 65% rule filter. Duplicate files are skipped automatically.`
-        : 'Run the Screener pipeline. Once stocks pass the 65% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.';
+        ? `Upload annual reports, concalls, or quarterly reports for the ${stocks.length} stocks that passed the 75% rule filter. Duplicate files are skipped automatically.`
+        : 'Run the Screener pipeline. Once stocks pass the 75% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.';
       for (const stock of stocks) {
         const tr = document.createElement('tr');
         const docs = stock.documents || [];
@@ -680,10 +738,35 @@ INDEX_HTML = r"""
           </td>
           <td>
             <form class="upload" data-stock="${stock.stock_id}" data-name="${escapeAttr(stock.company_name)}">
+              <div class="field-row">
+                <input type="number" name="document_year" min="1900" max="2100" placeholder="Year">
+                <select name="document_quarter">
+                  <option value="">Quarter optional</option>
+                  <option value="Q1">Q1</option>
+                  <option value="Q2">Q2</option>
+                  <option value="Q3">Q3</option>
+                  <option value="Q4">Q4</option>
+                </select>
+              </div>
               <input type="file" name="file" multiple accept=".pdf,.txt,.md,.html,.htm,.csv,.json">
               <button type="submit" class="secondary">Upload</button>
             </form>
             <div class="docs">${docs.length} document(s), ${docs.reduce((a,d)=>a+(d.chunk_count||0),0)} chunks</div>
+            <form class="qa-box" data-stock="${stock.stock_id}">
+              <textarea name="question" placeholder="Ask this stock's uploaded documents"></textarea>
+              <div class="field-row">
+                <input type="number" name="document_year" min="1900" max="2100" placeholder="Filter year">
+                <select name="document_quarter">
+                  <option value="">All quarters</option>
+                  <option value="Q1">Q1</option>
+                  <option value="Q2">Q2</option>
+                  <option value="Q3">Q3</option>
+                  <option value="Q4">Q4</option>
+                </select>
+              </div>
+              <button type="submit" class="secondary">Ask Documents</button>
+            </form>
+            <div class="qa-answer" id="qa-${escapeAttr(stock.stock_id)}" style="${qaAnswers[stock.stock_id] ? '' : 'display:none;'}">${renderQaAnswer(qaAnswers[stock.stock_id])}</div>
           </td>
           <td>
             ${ai.total_score_out_of_100 !== undefined ? `<span class="badge">${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
@@ -700,6 +783,9 @@ INDEX_HTML = r"""
       document.querySelectorAll('form.upload').forEach(form => {
         form.addEventListener('submit', uploadForm);
       });
+      document.querySelectorAll('form.qa-box').forEach(form => {
+        form.addEventListener('submit', askForm);
+      });
       document.querySelectorAll('.eval-one').forEach(btn => {
         btn.addEventListener('click', () => evaluate(btn.dataset.stock));
       });
@@ -713,10 +799,38 @@ INDEX_HTML = r"""
       const data = new FormData();
       data.append('stock_id', form.dataset.stock);
       data.append('company_name', form.dataset.name);
+      data.append('document_year', form.elements.document_year.value || '');
+      data.append('document_quarter', form.elements.document_quarter.value || '');
       for (const file of input.files) data.append('file', file);
       await api('/api/upload', { method: 'POST', body: data });
       input.value = '';
       await refresh();
+    }
+
+    async function askForm(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const stockId = form.dataset.stock;
+      const question = form.question.value.trim();
+      if (!question) return;
+      qaAnswers[stockId] = { loading: true, answer: 'Searching uploaded documents...' };
+      renderStocks(latest.stocks || []);
+      try {
+        const response = await api('/api/ask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            stock_id: stockId,
+            question,
+            document_year: form.elements.document_year.value || '',
+            document_quarter: form.elements.document_quarter.value || ''
+          })
+        });
+        qaAnswers[stockId] = response.answer;
+      } catch (error) {
+        qaAnswers[stockId] = { answer: `Error: ${error.message}`, citations: [], limitations: [] };
+      }
+      renderStocks(latest.stocks || []);
     }
 
     async function evaluate(stockId) {
@@ -752,6 +866,25 @@ INDEX_HTML = r"""
         rule_13_cfo_ebitda: 'CFO/EBITDA'
       };
       return names[name] || name;
+    }
+    function renderQaAnswer(result) {
+      if (!result) return '';
+      if (result.loading) return escapeHtml(result.answer || '');
+      const citations = (result.citations || []).map(citation => {
+        const pageStart = citation.page_start;
+        const pageEnd = citation.page_end || pageStart;
+        const page = pageStart && pageEnd && pageStart !== pageEnd
+          ? `pp. ${pageStart}-${pageEnd}`
+          : (pageStart ? `p. ${pageStart}` : 'page unknown');
+        const meta = [citation.document_year, citation.document_quarter].filter(Boolean).join(' ');
+        return `${citation.source_id}: ${citation.document_name} (${page}${meta ? ', ' + meta : ''})`;
+      });
+      const limitations = result.limitations || [];
+      return `
+${escapeHtml(result.answer || '')}
+${citations.length ? '\n\nCitations:\n' + escapeHtml(citations.map(item => '- ' + item).join('\n')) : ''}
+${limitations.length ? '\n\nLimitations:\n' + escapeHtml(limitations.map(item => '- ' + item).join('\n')) : ''}
+`.trim();
     }
     function ruleDetailsFromStock(stock) {
       const names = [

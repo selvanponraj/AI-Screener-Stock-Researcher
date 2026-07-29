@@ -130,6 +130,17 @@ EVALUATION_RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
+DOCUMENT_QA_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "citation_source_ids": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["answer", "citation_source_ids", "limitations"],
+}
+
+
 QUESTION_SPECS: tuple[QuestionSpec, ...] = (
     QuestionSpec(
         question_id="future_outlook",
@@ -235,22 +246,6 @@ def extract_generate_content_citations(payload: dict[str, Any]) -> list[dict[str
             unique.append(citation)
             seen.add(citation["url"])
     return unique
-
-
-def stock_context(stock: dict[str, Any]) -> str:
-    return json.dumps(
-        {
-            "company_name": stock.get("company_name"),
-            "company_url": stock.get("company_url"),
-            "market_categories": stock.get("market_categories"),
-            "first_11_pass_count": stock.get("first_11_pass_count"),
-            "excel_rule_pass_count": stock.get("excel_rule_pass_count"),
-            "total_rule_pass_count": stock.get("total_rule_pass_count"),
-            "rule_pass_percentage": stock.get("rule_pass_percentage"),
-            "rule_score_out_of_50": stock.get("rule_score_out_of_50"),
-        },
-        indent=2,
-    )
 
 
 def safe_name(value: str) -> str:
@@ -382,24 +377,97 @@ def chunk_refs(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "filename": chunk.get("filename"),
                 "document_sha": chunk.get("document_sha"),
                 "chunk_index": chunk.get("chunk_index"),
+                "page_start": chunk.get("page_start"),
+                "page_end": chunk.get("page_end"),
                 "score": round(float(chunk.get("score", 0) or 0), 3),
             }
         )
     return refs
 
 
+def page_label(chunk: dict[str, Any]) -> str:
+    page_start = int(chunk.get("page_start") or 0)
+    page_end = int(chunk.get("page_end") or page_start or 0)
+    if page_start and page_end and page_start != page_end:
+        return f"pages {page_start}-{page_end}"
+    if page_start:
+        return f"page {page_start}"
+    return "page unknown"
+
+
 def format_rag_context(chunks: list[dict[str, Any]], max_chunks: int = 10) -> str:
     lines = []
     for chunk in chunks[:max_chunks]:
         lines.append(
-            f"[{chunk.get('filename')} chunk {chunk.get('chunk_index')} score={float(chunk.get('score', 0)):.3f}]\n"
+            f"[{chunk.get('filename')} {page_label(chunk)} chunk {chunk.get('chunk_index')} score={float(chunk.get('score', 0)):.3f}]\n"
             f"{chunk.get('text')}"
         )
     return "\n\n".join(lines) or "No uploaded document chunks were retrieved for this question."
 
 
+def format_document_qa_context(chunks: list[dict[str, Any]]) -> tuple[str, dict[str, dict[str, Any]]]:
+    source_map: dict[str, dict[str, Any]] = {}
+    lines: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        source_id = f"S{index}"
+        source_map[source_id] = chunk
+        lines.append(
+            f"[{source_id}]\n"
+            f"Document: {chunk.get('filename', '')}\n"
+            f"Pages: {page_label(chunk)}\n"
+            f"Year: {chunk.get('document_year', '')}\n"
+            f"Quarter: {chunk.get('document_quarter', '')}\n"
+            f"Chunk: {chunk.get('chunk_index', '')}\n"
+            f"Similarity score: {float(chunk.get('score', 0) or 0):.3f}\n"
+            f"Excerpt:\n{chunk.get('text', '')}"
+        )
+    return "\n\n".join(lines), source_map
+
+
+def build_document_qa_prompt(
+    stock: dict[str, Any],
+    question: str,
+    context: str,
+    document_year: str = "",
+    document_quarter: str = "",
+) -> str:
+    filters = {
+        "document_year": document_year or "all uploaded years",
+        "document_quarter": document_quarter or "all uploaded quarters",
+    }
+    return f"""
+You are answering a user's question about {stock.get('company_name', 'the company')} using only uploaded document excerpts.
+
+Question:
+{question}
+
+Metadata filters applied:
+{json.dumps(filters, indent=2)}
+
+Evidence excerpts:
+{context}
+
+Instructions:
+- Answer only from the excerpts above.
+- If the excerpts do not answer the question, say that the uploaded documents do not provide enough evidence.
+- citation_source_ids must contain only source IDs like S1, S2 from the excerpts that directly support the answer.
+- Do not cite a source ID unless it directly supports the answer.
+- Keep the answer practical and concise.
+
+Return JSON matching the schema.
+""".strip()
+
+
 def build_section_prompt(stock: dict[str, Any], spec: QuestionSpec, context: str) -> str:
     company = stock.get("company_name", "the company")
+    company_context = json.dumps(
+        {
+            "company_name": stock.get("company_name"),
+            "company_url": stock.get("company_url"),
+            "market_categories": stock.get("market_categories"),
+        },
+        indent=2,
+    )
     if spec.search_kind != "none":
         evidence_instruction = "Use only the external search snippets below for current web evidence. Cite URLs from the provided sources in the evidence summary when useful. Do not invent facts beyond these snippets."
     else:
@@ -407,8 +475,8 @@ def build_section_prompt(stock: dict[str, Any], spec: QuestionSpec, context: str
     return f"""
 You are an equity research analyst evaluating {company}.
 
-Quantitative context:
-{stock_context(stock)}
+Company context:
+{company_context}
 
 Step: {spec.title}
 Question: {spec.question}
@@ -430,16 +498,22 @@ Return concise JSON matching the response schema:
 
 def build_final_prompt(stock: dict[str, Any], analyses: dict[str, dict[str, Any]]) -> str:
     company = stock.get("company_name", "the company")
+    quantitative_score = json.dumps(
+        {
+            "rule_score_out_of_50": stock.get("rule_score_out_of_50"),
+        },
+        indent=2,
+    )
     return f"""
 You are the final equity research scoring node for {company}.
 
-Quantitative context:
-{stock_context(stock)}
+Quantitative score from scraping and Excel rules:
+{quantitative_score}
 
 Question-by-question AI analyses:
 {json.dumps(analyses, indent=2)}
 
-Create the final stock evaluation. Use the quantitative rule score as the first 50 points. Assign ai_score_out_of_50 from the question analyses, considering:
+Create the final stock evaluation. Use rule_score_out_of_50 as the deterministic first 50 points. Assign ai_score_out_of_50 from the question analyses only, considering:
 - future growth/outlook quality
 - concrete initiative progress
 - management promise delivery
@@ -661,6 +735,7 @@ def final_scoring_node(state: EvaluationState) -> EvaluationState:
     result["raw_payload"] = raw_payload
     result["rag_chunk_count"] = sum(len(chunks) for chunks in state.get("section_chunk_refs", {}).values())
     result["rag_queries"] = {spec.question_id: list(spec.retrieval_queries) for spec in QUESTION_SPECS}
+    result.update(document_store.stock_document_fingerprint(str(state["stock_id"])))
     save_evaluation(str(state["stock_id"]), result)
     return {**state, "final_prompt": prompt, "final_raw_model_text": raw_text, "final_raw_payload": raw_payload, "result": result}
 
@@ -706,6 +781,9 @@ def evaluate_stock(stock: dict[str, Any], api_key: str | None = None, model: str
         os.environ["GEMINI_API_KEY"] = api_key
     if model:
         os.environ["GEMINI_MODEL"] = model
+    cached = current_evaluation(str(stock["stock_id"]))
+    if cached:
+        return cached
     return run_evaluation_graph(stock)
 
 
@@ -719,3 +797,84 @@ def load_evaluation(stock_id: str) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def current_evaluation(stock_id: str) -> dict[str, Any] | None:
+    evaluation = load_evaluation(stock_id)
+    if not evaluation:
+        return None
+    document_state = document_store.stock_document_fingerprint(stock_id)
+    if evaluation.get("document_fingerprint") != document_state["document_fingerprint"]:
+        return None
+    if int(evaluation.get("document_count", -1)) != int(document_state["document_count"]):
+        return None
+    return evaluation
+
+
+def answer_document_question(
+    stock: dict[str, Any],
+    question: str,
+    document_year: str = "",
+    document_quarter: str = "",
+) -> dict[str, Any]:
+    question = question.strip()
+    if not question:
+        raise RuntimeError("Question is required.")
+
+    stock_id = str(stock["stock_id"])
+    chunks = document_store.search_chunks(
+        stock_id,
+        question,
+        limit=8,
+        document_year=document_year.strip(),
+        document_quarter=document_quarter.strip(),
+    )
+    if not chunks:
+        return {
+            "answer": "No matching uploaded document chunks were found for this question and filter.",
+            "citations": [],
+            "limitations": ["Upload relevant documents or remove the year/quarter filter and try again."],
+            "retrieved_chunk_count": 0,
+        }
+
+    context, source_map = format_document_qa_context(chunks)
+    prompt = build_document_qa_prompt(stock, question, context, document_year, document_quarter)
+    api_key, model = gemini_settings()
+    parsed, raw_text, _citations, raw_payload = gemini_json(
+        prompt,
+        api_key,
+        model,
+        DOCUMENT_QA_RESPONSE_SCHEMA,
+    )
+
+    citations: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source_id in parsed.get("citation_source_ids", []) or []:
+        source_id = str(source_id)
+        chunk = source_map.get(source_id)
+        if not chunk or source_id in seen:
+            continue
+        seen.add(source_id)
+        page_start = int(chunk.get("page_start") or 0)
+        page_end = int(chunk.get("page_end") or page_start or 0)
+        citations.append(
+            {
+                "source_id": source_id,
+                "document_name": chunk.get("filename", ""),
+                "page_start": page_start if page_start else None,
+                "page_end": page_end if page_end else None,
+                "document_year": chunk.get("document_year", ""),
+                "document_quarter": chunk.get("document_quarter", ""),
+                "chunk_index": chunk.get("chunk_index", ""),
+                "similarity_score": round(float(chunk.get("score", 0) or 0), 3),
+            }
+        )
+
+    return {
+        "answer": str(parsed.get("answer", "")),
+        "citations": citations,
+        "limitations": parsed.get("limitations", []) or [],
+        "retrieved_chunk_count": len(chunks),
+        "raw_model_text": raw_text,
+        "raw_payload": raw_payload,
+    }

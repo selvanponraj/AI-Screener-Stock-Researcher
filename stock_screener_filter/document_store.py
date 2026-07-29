@@ -37,6 +37,8 @@ class StoredDocument:
     text_chars: int
     chunk_count: int
     duplicate: bool
+    document_year: str = ""
+    document_quarter: str = ""
     note: str = ""
 
 
@@ -73,7 +75,14 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def save_upload(stock_id: str, company_name: str, filename: str, source: BinaryIO) -> StoredDocument:
+def save_upload(
+    stock_id: str,
+    company_name: str,
+    filename: str,
+    source: BinaryIO,
+    document_year: str = "",
+    document_quarter: str = "",
+) -> StoredDocument:
     ensure_dirs()
     stock_raw_dir = RAW_DIR / stock_id
     stock_raw_dir.mkdir(parents=True, exist_ok=True)
@@ -96,26 +105,32 @@ def save_upload(stock_id: str, company_name: str, filename: str, source: BinaryI
             text_chars=int(existing.get("text_chars", 0)),
             chunk_count=int(existing.get("chunk_count", 0)),
             duplicate=True,
+            document_year=str(existing.get("document_year", "")),
+            document_quarter=str(existing.get("document_quarter", "")),
             note="Already uploaded for this stock.",
         )
 
     stored_path = stock_raw_dir / f"{digest[:12]}_{safe_name(filename)}"
     temp_path.replace(stored_path)
-    text, note = extract_text(stored_path)
-    chunks = chunk_text(text)
-    write_chunks(stock_id, digest, filename, chunks)
+    pages, note = extract_pages(stored_path)
+    chunks = chunk_pages(pages)
+    write_chunks(stock_id, digest, filename, chunks, document_year, document_quarter)
+    text_chars = sum(len(page["text"]) for page in pages)
+    load_env()
     stock_docs[digest] = {
         "company_name": company_name,
         "filename": filename,
         "sha256": digest,
         "stored_path": str(stored_path.relative_to(PROJECT_ROOT)),
-        "text_chars": len(text),
+        "text_chars": text_chars,
         "chunk_count": len(chunks),
-        "embedding_model": embedding_model_name(),
-        "embedding_dimensions": embedding_dimensions(),
+        "document_year": document_year,
+        "document_quarter": document_quarter,
+        "embedding_model": DEFAULT_EMBEDDING_MODEL,
+        "embedding_dimensions": int(embedding_model().get_sentence_embedding_dimension() or 0),
         "chunker": "RecursiveCharacterTextSplitter",
-        "chunk_size": chunk_size(),
-        "chunk_overlap": chunk_overlap(),
+        "chunk_size": int(os.environ.get("RAG_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE))),
+        "chunk_overlap": int(os.environ.get("RAG_CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP))),
         "note": note,
     }
     save_document_index(index)
@@ -125,67 +140,122 @@ def save_upload(stock_id: str, company_name: str, filename: str, source: BinaryI
         filename=filename,
         sha256=digest,
         stored_path=str(stored_path),
-        text_chars=len(text),
+        text_chars=text_chars,
         chunk_count=len(chunks),
         duplicate=False,
+        document_year=document_year,
+        document_quarter=document_quarter,
         note=note,
     )
 
 
-def extract_text(path: Path) -> tuple[str, str]:
+def extract_pages(path: Path) -> tuple[list[dict[str, object]], str]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return extract_pdf_text(path)
+        return extract_pdf_pages(path)
     if suffix in {".txt", ".md", ".csv", ".json", ".log"}:
-        return path.read_text(encoding="utf-8", errors="ignore"), ""
+        return [{"number": 1, "text": path.read_text(encoding="utf-8", errors="ignore")}], ""
     if suffix in {".html", ".htm"}:
         text = path.read_text(encoding="utf-8", errors="ignore")
         text = re.sub(r"<script\b.*?</script>", " ", text, flags=re.I | re.S)
         text = re.sub(r"<style\b.*?</style>", " ", text, flags=re.I | re.S)
         text = re.sub(r"<[^>]+>", " ", text)
-        return html.unescape(" ".join(text.split())), ""
-    return path.read_text(encoding="utf-8", errors="ignore"), "Read as plain text."
+        return [{"number": 1, "text": html.unescape(" ".join(text.split()))}], ""
+    return [{"number": 1, "text": path.read_text(encoding="utf-8", errors="ignore")}], "Read as plain text."
 
 
-def extract_pdf_text(path: Path) -> tuple[str, str]:
+def extract_pdf_pages(path: Path) -> tuple[list[dict[str, object]], str]:
     try:
         from pypdf import PdfReader
     except ImportError:
-        return "", "PDF text extraction needs pypdf. Run: pip install -r requirements.txt"
+        return [], "PDF text extraction needs pypdf. Run: pip install -r requirements.txt"
 
     reader = PdfReader(str(path))
-    pages: list[str] = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return "\n\n".join(pages), ""
+    pages: list[dict[str, object]] = []
+    for index, page in enumerate(reader.pages, start=1):
+        pages.append({"number": index, "text": page.extract_text() or ""})
+    return pages, ""
 
 
-def chunk_size() -> int:
-    load_env()
-    return int(os.environ.get("RAG_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
+def clean_extracted_text(text: str) -> str:
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
-def chunk_overlap() -> int:
-    load_env()
-    return int(os.environ.get("RAG_CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP)))
-
-
-def chunk_text(text: str) -> list[str]:
-    cleaned = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    if not cleaned:
+def split_text_with_offsets(text: str) -> list[dict[str, object]]:
+    if not text:
         return []
+    load_env()
     try:
         from langchain_text_splitters import RecursiveCharacterTextSplitter
     except ImportError as exc:
         raise RuntimeError("LangChain text splitters are not installed. Run: python -m pip install -r requirements.txt") from exc
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size(),
-        chunk_overlap=chunk_overlap(),
+        chunk_size=int(os.environ.get("RAG_CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE))),
+        chunk_overlap=int(os.environ.get("RAG_CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP))),
         separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""],
         length_function=len,
+        add_start_index=True,
     )
-    return [chunk.strip() for chunk in splitter.split_text(cleaned) if chunk.strip()]
+    chunks: list[dict[str, object]] = []
+    for document in splitter.create_documents([text]):
+        raw_text = document.page_content
+        chunk_text = raw_text.strip()
+        if not chunk_text:
+            continue
+        leading_trim = len(raw_text) - len(raw_text.lstrip())
+        start = int(document.metadata.get("start_index", 0) or 0) + leading_trim
+        chunks.append(
+            {
+                "text": chunk_text,
+                "start": start,
+                "end": start + len(chunk_text),
+            }
+        )
+    return chunks
+
+
+def chunk_pages(pages: list[dict[str, object]]) -> list[dict[str, object]]:
+    parts: list[str] = []
+    page_spans: list[dict[str, int]] = []
+    cursor = 0
+    for page in pages:
+        page_num = int(page.get("number", 0) or 0)
+        page_text = clean_extracted_text(str(page.get("text", "")))
+        if not page_text:
+            continue
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        start = cursor
+        parts.append(page_text)
+        cursor += len(page_text)
+        page_spans.append({"page": page_num, "start": start, "end": cursor})
+
+    full_text = "".join(parts)
+    if not full_text:
+        return []
+
+    chunks: list[dict[str, object]] = []
+    for chunk in split_text_with_offsets(full_text):
+        start = int(chunk["start"])
+        end = int(chunk["end"])
+        pages_for_chunk = [
+            span["page"]
+            for span in page_spans
+            if span["start"] < end and span["end"] > start
+        ]
+        if not pages_for_chunk:
+            continue
+        chunks.append(
+            {
+                "text": str(chunk["text"]),
+                "page_start": pages_for_chunk[0],
+                "page_end": pages_for_chunk[-1],
+                "pages": ",".join(str(page) for page in pages_for_chunk if page),
+            }
+        )
+    return chunks
 
 
 def chroma_client() -> object:
@@ -213,26 +283,9 @@ def stock_collection(stock_id: str) -> object:
         metadata={
             "hnsw:space": "cosine",
             "stock_id": stock_id,
-            "embedding_model": embedding_model_name(),
+            "embedding_model": DEFAULT_EMBEDDING_MODEL,
         },
     )
-
-
-def embedding_model_name() -> str:
-    return DEFAULT_EMBEDDING_MODEL
-
-
-def embedding_cache_exists() -> bool:
-    model_cache_name = f"models--{embedding_model_name().replace('/', '--')}"
-    return (MODEL_CACHE_DIR / model_cache_name).exists()
-
-
-def embedding_local_files_only() -> bool:
-    load_env()
-    configured = os.environ.get("EMBEDDING_LOCAL_FILES_ONLY")
-    if configured is not None:
-        return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return embedding_cache_exists()
 
 
 @lru_cache(maxsize=1)
@@ -241,7 +294,12 @@ def embedding_model() -> object:
     os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR))
     os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str(MODEL_CACHE_DIR))
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    local_files_only = embedding_local_files_only()
+    configured_local_only = os.environ.get("EMBEDDING_LOCAL_FILES_ONLY")
+    if configured_local_only is None:
+        model_cache_name = f"models--{DEFAULT_EMBEDDING_MODEL.replace('/', '--')}"
+        local_files_only = (MODEL_CACHE_DIR / model_cache_name).exists()
+    else:
+        local_files_only = configured_local_only.strip().lower() in {"1", "true", "yes", "on"}
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -249,40 +307,34 @@ def embedding_model() -> object:
 
     device = os.environ.get("EMBEDDING_DEVICE") or None
     return SentenceTransformer(
-        embedding_model_name(),
+        DEFAULT_EMBEDDING_MODEL,
         cache_folder=str(MODEL_CACHE_DIR),
         device=device,
         local_files_only=local_files_only,
     )
 
 
-def embedding_dimensions() -> int:
-    dimensions = embedding_model().get_sentence_embedding_dimension()
-    return int(dimensions or 0)
-
-
-def embedding_batch_size() -> int:
-    load_env()
-    return int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
-
-
 def embeddings(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
+    load_env()
     encoded = embedding_model().encode(
         texts,
-        batch_size=embedding_batch_size(),
+        batch_size=int(os.environ.get("EMBEDDING_BATCH_SIZE", "16")),
         normalize_embeddings=True,
         show_progress_bar=False,
     )
     return [vector.tolist() for vector in encoded]
 
 
-def embedding(text: str) -> list[float]:
-    return embeddings([text])[0]
-
-
-def write_chunks(stock_id: str, document_sha: str, filename: str, chunks: list[str]) -> None:
+def write_chunks(
+    stock_id: str,
+    document_sha: str,
+    filename: str,
+    chunks: list[dict[str, object]],
+    document_year: str = "",
+    document_quarter: str = "",
+) -> None:
     if not chunks:
         return
     collection = stock_collection(stock_id)
@@ -293,15 +345,21 @@ def write_chunks(stock_id: str, document_sha: str, filename: str, chunks: list[s
             "document_sha": document_sha,
             "filename": filename,
             "chunk_index": index,
-            "embedding_model": embedding_model_name(),
+            "page_start": int(chunk.get("page_start", 0) or 0),
+            "page_end": int(chunk.get("page_end", 0) or 0),
+            "pages": str(chunk.get("pages", "")),
+            "document_year": document_year,
+            "document_quarter": document_quarter,
+            "embedding_model": DEFAULT_EMBEDDING_MODEL,
         }
-        for index in range(1, len(chunks) + 1)
+        for index, chunk in enumerate(chunks, start=1)
     ]
+    texts = [str(chunk.get("text", "")) for chunk in chunks]
     collection.upsert(
         ids=ids,
-        documents=chunks,
+        documents=texts,
         metadatas=metadatas,
-        embeddings=embeddings(chunks),
+        embeddings=embeddings(texts),
     )
 
 
@@ -324,14 +382,35 @@ def load_chunks(stock_id: str) -> list[dict[str, object]]:
     return chunks
 
 
-def search_chunks(stock_id: str, query: str, limit: int = 10) -> list[dict[str, object]]:
+def search_chunks(
+    stock_id: str,
+    query: str,
+    limit: int = 10,
+    document_year: str = "",
+    document_quarter: str = "",
+) -> list[dict[str, object]]:
     collection = stock_collection(stock_id)
     if collection.count() == 0:
         return []
+    filters = []
+    if document_year:
+        filters.append({"document_year": document_year})
+    if document_quarter:
+        filters.append({"document_quarter": document_quarter})
+    where = None
+    if len(filters) == 1:
+        where = filters[0]
+    elif len(filters) > 1:
+        where = {"$and": filters}
+    query_kwargs = {
+        "query_embeddings": [embeddings([query])[0]],
+        "n_results": min(limit, collection.count()),
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        query_kwargs["where"] = where
     result = collection.query(
-        query_embeddings=[embedding(query)],
-        n_results=min(limit, collection.count()),
-        include=["documents", "metadatas", "distances"],
+        **query_kwargs,
     )
     chunks: list[dict[str, object]] = []
     for text, metadata, distance in zip(
@@ -352,3 +431,14 @@ def search_chunks(stock_id: str, query: str, limit: int = 10) -> list[dict[str, 
 def stock_documents(stock_id: str) -> list[dict[str, object]]:
     index = load_document_index()
     return list(index.get(stock_id, {}).values())
+
+
+def stock_document_fingerprint(stock_id: str) -> dict[str, object]:
+    documents = stock_documents(stock_id)
+    hashes = sorted(str(document.get("sha256", "")) for document in documents if document.get("sha256"))
+    digest = hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()
+    return {
+        "document_count": len(hashes),
+        "document_hashes": hashes,
+        "document_fingerprint": digest,
+    }
