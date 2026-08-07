@@ -202,7 +202,6 @@ def login_command() -> tuple[str, list[str]]:
             "stock_screener_filter.screener_login",
             "--url",
             "https://www.screener.in/",
-            "--manual",
             "--timeout-seconds",
             "300",
         ],

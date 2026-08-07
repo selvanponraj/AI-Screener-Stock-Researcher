@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout-seconds",
         type=int,
-        default=60,
+        default=300,
         help="How long to wait for Screener to accept login before failing.",
     )
     parser.add_argument(
@@ -139,14 +139,14 @@ def get_credentials(args: argparse.Namespace) -> tuple[str, str]:
     email = args.email or input("Screener email: ").strip()
     password = os.getenv(args.password_env)
 
-    if not email:
-        raise ValueError("Screener email is required.")
+    if not email or email.strip().lower().startswith("your-"):
+        raise ValueError("Set SCREENER_EMAIL in .env before running automatic login.")
 
     if password is None:
         password = getpass.getpass(f"Screener password ({args.password_env}): ")
 
-    if not password:
-        raise ValueError("Screener password is required.")
+    if not password or password.strip().lower().startswith("your-"):
+        raise ValueError("Set SCREENER_PASSWORD in .env before running automatic login.")
 
     return email, password
 
