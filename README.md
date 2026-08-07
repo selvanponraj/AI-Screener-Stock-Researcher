@@ -697,3 +697,57 @@ python -m compileall stock_screener_filter
 
 This does not test Screener access, Gemini access, or document upload behavior,
 but it catches syntax/import issues.
+
+## Roadmap
+
+These are planned features and architecture upgrades for future versions:
+
+1. **Hybrid retrieval with BM25, RRF, and cross-encoder reranking**
+
+   Add keyword retrieval alongside semantic search, fuse both rankings with
+   Reciprocal Rank Fusion, and rerank candidate chunks with a cross-encoder.
+   This should improve retrieval for exact metric names, management phrases,
+   project names, years, quarters, and financial terms.
+
+   Issue: https://github.com/arakshay60/AI-Screener-Stock-Researcher/issues/1
+
+2. **Table-aware chunking for financial PDFs**
+
+   Extract tables separately from reports and concall PDFs, convert them to
+   Markdown, and store each table as its own retrievable chunk with nearby
+   heading/paragraph context. This is important for P&L tables, segment revenue,
+   guidance tables, order books, and other numeric disclosures.
+
+   Issue: https://github.com/arakshay60/AI-Screener-Stock-Researcher/issues/2
+
+3. **Agentic query router and multi-step RAG orchestration**
+
+   Replace the single fixed retrieve-and-answer flow with a lightweight
+   upfront router plus an agentic RAG orchestrator. The orchestrator should be
+   able to decompose compound questions, walk across periods, summarize whole
+   documents, verify absence/negative queries, handle verbatim quote requests,
+   and run deterministic compute steps.
+
+   Issue: https://github.com/arakshay60/AI-Screener-Stock-Researcher/issues/3
+
+4. **Migrate app state from JSON files to SQLite**
+
+   Move document metadata, deduplication hashes, AI evaluation cache, Q&A
+   traces, and pipeline run state from JSON files into a local SQLite database.
+   Chroma should remain responsible for vector storage, while SQLite becomes
+   the source of truth for structured local app state.
+
+   Issue: https://github.com/arakshay60/AI-Screener-Stock-Researcher/issues/4
+
+5. **Whole-knowledge-base Q&A across stocks**
+
+   Add the ability to ask questions across the full uploaded knowledge base,
+   not just one stock at a time. This should support comparing different
+   companies, comparing companies in the same industry, identifying common
+   themes, and contrasting management commentary across peers.
+
+6. **Web search inside Document Q&A**
+
+   Add an optional search tool to Document Q&A for questions that require
+   latest news, recent market sentiment, industry trends, regulatory updates,
+   or other online context that is not present in uploaded documents.
