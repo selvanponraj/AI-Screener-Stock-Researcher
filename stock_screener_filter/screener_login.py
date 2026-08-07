@@ -16,6 +16,7 @@ from stock_screener_filter.config import load_env
 
 load_env()
 DEFAULT_URL = "https://www.screener.in/"
+ACCOUNT_URL = "https://www.screener.in/user/account/"
 DEFAULT_BROWSER_CHANNEL = os.getenv("SCREENER_BROWSER_CHANNEL", "msedge").strip() or "msedge"
 DEFAULT_PROFILE_DIR = Path(
     os.getenv(
@@ -132,6 +133,15 @@ def looks_logged_in(page: Page) -> bool:
 def verify_logged_in_session(page: Page, url: str = DEFAULT_URL) -> bool:
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_timeout(1_000)
+    if looks_logged_in(page):
+        return True
+
+    page.goto(ACCOUNT_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1_000)
+    current = urlparse(page.url)
+    if current.netloc.lower().endswith("screener.in") and "/login/" not in current.path.lower():
+        return True
+
     return looks_logged_in(page)
 
 
@@ -171,17 +181,23 @@ def login_with_credentials(
     print("Submitting Screener email login...", flush=True)
     page.locator("button[type='submit'], input[type='submit']").first.click()
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=timeout_seconds * 1_000)
-    except TimeoutError:
-        pass
+    for elapsed_seconds in range(timeout_seconds):
+        page.wait_for_timeout(1_000)
+        if looks_logged_in(page):
+            print("Login confirmed.", flush=True)
+            return
 
-    if not looks_logged_in(page):
-        raise RuntimeError(
-            "Screener login did not complete. Check the email/password or any on-page prompt."
-        )
+        if elapsed_seconds >= 2 and elapsed_seconds % 5 == 0:
+            try:
+                if verify_logged_in_session(page):
+                    print("Login confirmed.", flush=True)
+                    return
+            except (Error, TimeoutError):
+                continue
 
-    print("Login confirmed.", flush=True)
+    raise RuntimeError(
+        "Screener login did not complete. Check the email/password or any on-page prompt."
+    )
 
 
 def wait_for_manual_login(page: Page, login_url: str, timeout_seconds: int) -> None:
@@ -233,7 +249,7 @@ def main() -> int:
         page.goto(args.url, wait_until="domcontentloaded")
         page.wait_for_timeout(2_000)
 
-        if looks_logged_in(page):
+        if verify_logged_in_session(page, args.url):
             print("Already logged in to Screener.", flush=True)
         else:
             login_url = urljoin(args.url, "/login/")
