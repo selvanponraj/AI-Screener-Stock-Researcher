@@ -66,6 +66,28 @@ The scraper uses Playwright. By default this repo uses Microsoft Edge because it
 has worked reliably with Screener login in this project. Other users can switch
 to Chrome or Playwright Chromium by changing the browser channel.
 
+## Tech Stack
+
+- **Language:** Python 3.9+
+- **Local web app:** Python standard-library HTTP server in
+  `stock_screener_filter.app_server`
+- **Browser automation / scraping:** Playwright with persistent browser
+  profiles for Screener login sessions
+- **Supported scraper browsers:** Microsoft Edge, Google Chrome, or
+  Playwright Chromium
+- **HTML parsing:** Beautiful Soup and Python HTML parsing utilities
+- **Excel parsing:** OpenPyXL for Screener Excel exports
+- **PDF text extraction:** PyPDF for uploaded reports and transcripts
+- **Document chunking:** LangChain text splitters
+- **Embedding model:** local `BAAI/bge-m3` through `sentence-transformers`
+- **Vector database:** ChromaDB stored locally under `data/chroma_db/`
+- **RAG orchestration:** LangGraph for multi-step AI evaluation flow
+- **LLM:** Gemini, configured through `GEMINI_MODEL` in `.env`
+- **Structured AI outputs:** Pydantic schemas plus JSON validation
+- **External search:** DuckDuckGo search through `ddgs`
+- **Local config/secrets:** `.env` loaded with `python-dotenv`
+- **Current local state storage:** JSON files under `data/`
+
 ## Critical Screener Setup
 
 Do this before running the full pipeline. This is the most important setup step.
