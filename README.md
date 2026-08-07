@@ -286,12 +286,6 @@ Or use the cross-platform launcher:
 python run_app.py
 ```
 
-Windows users can also use:
-
-```powershell
-.\run_app.ps1
-```
-
 Open:
 
 ```text

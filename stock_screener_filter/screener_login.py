@@ -12,10 +12,17 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
 
+from stock_screener_filter.config import load_env
 
+load_env()
 DEFAULT_URL = "https://www.screener.in/"
-DEFAULT_BROWSER_CHANNEL = "msedge"
-DEFAULT_PROFILE_DIR = Path(".browser") / "screener-profile-edge"
+DEFAULT_BROWSER_CHANNEL = os.getenv("SCREENER_BROWSER_CHANNEL", "msedge").strip() or "msedge"
+DEFAULT_PROFILE_DIR = Path(
+    os.getenv(
+        "SCREENER_PROFILE_DIR",
+        str(Path(".browser") / f"screener-profile-{DEFAULT_BROWSER_CHANNEL.lower().replace('msedge', 'edge')}"),
+    )
+)
 
 LOGIN_SELECTORS = (
     "a[href*='/login']",
