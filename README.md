@@ -3,8 +3,8 @@
 AI Stock Researcher is a local research assistant for automating the stock
 screening workflow I used to do manually for investments. It starts with
 rule-based filtering from Screener.in, narrows the universe to companies that
-pass quantitative checks, and then uses uploaded annual reports, concalls, and
-quarterly reports to judge management commentary, execution quality, and
+pass quantitative checks, and then uses uploaded reports and concalls to judge
+management commentary, execution quality, and
 business outlook.
 
 The project is local-first. Screener HTML, Excel exports, uploaded documents,
@@ -13,22 +13,39 @@ machine under `data/`. Secrets stay in `.env`, which is gitignored.
 
 ## What This App Does
 
+This app has two stages.
+
+Stage 1 is the quantitative Screener pipeline:
+
 ```text
-Screener screens
--> screen page HTML
--> company profile HTML
--> 11 HTML rules
+Your Screener screens
+-> all paginated screen result pages
+-> every company profile linked from those screens
+-> HTML-based rule checks
 -> Screener Excel exports
--> 2 Excel rules
--> >=75% rule-filtered stocks
--> document upload per stock
--> Chroma vector store
--> document Q&A and AI evaluation
--> final score out of 100
+-> Excel-based rule checks
+-> companies that pass at least 10 of 13 rules
 ```
 
-The final quantitative filter currently requires at least 75% of the 13 rules,
-which means a company must pass at least 10 out of 13 rules.
+The 13 rules cover valuation, historical P/E comparison, ROCE, ROE, debt,
+pledging, sales growth consistency, profit growth, price CAGR vs profit growth,
+promoter holding change, SSGR, and CFO/EBITDA.
+
+Stage 2 is document-based research:
+
+```text
+Upload reports/transcripts for filtered stocks
+-> deduplicate files
+-> extract and chunk text with page ranges
+-> embed chunks with local BGE-M3
+-> store vectors in ChromaDB
+-> ask questions with citations
+-> run AI evaluation and final scoring
+```
+
+The app is useful only if Screener is configured correctly before crawling.
+The company profile quick-ratio card must contain the required custom ratios,
+otherwise the crawler cannot collect the inputs needed for the rules.
 
 This method is designed for non-financial operating companies. Do not use the
 rule output for banks, NBFCs, insurance companies, financial-services firms, or
@@ -48,6 +65,62 @@ Install these before running the project:
 The scraper uses Playwright. By default this repo uses Microsoft Edge because it
 has worked reliably with Screener login in this project. Other users can switch
 to Chrome or Playwright Chromium by changing the browser channel.
+
+## Critical Screener Setup
+
+Do this before running the full pipeline. This is the most important setup step.
+The scraper reads rule inputs from Screener's company profile quick-ratio card.
+If the required ratios are not visible in the browser profile used by Playwright,
+profile crawling will fail or later rule outputs will be missing.
+
+Configure your Screener company profile so the quick-ratio section matches this
+format:
+
+![Required Screener company profile quick-ratio format](<docs/images/Screenshot 2026-07-24 053742.png>)
+
+These labels must be visible with these exact names:
+
+```text
+Stock P/E
+Industry PE
+3Yrs PE
+5Yrs PE
+7Yrs PE
+ROCE
+ROE
+Debt to equity
+DPR YOY
+Pledged percentage
+Promoter holding
+```
+
+Add this custom ratio in Screener:
+
+```text
+Ratio name: DPR YOY
+Short name: DPR YOY
+Ratio unit: Percentage
+Formula: ((Depreciation -Depreciation last year)/Depreciation last year)*100
+Description: Depreciation -Depreciation last year
+```
+
+The setup must be done in the same browser profile that the scraper uses. Open
+that profile with:
+
+```bash
+python -m stock_screener_filter.screener_login --manual --keep-open
+```
+
+In the browser window that opens:
+
+1. Log in to Screener.
+2. Open any company page.
+3. Configure the quick-ratio card.
+4. Confirm all required labels are visible.
+5. Press `Ctrl+C` in the terminal when done.
+
+The app also verifies login before crawling. If Screener is logged out, it opens
+the login window and waits for you to finish login.
 
 ## Fresh Setup
 
@@ -110,7 +183,7 @@ Set at least:
 
 ```env
 GEMINI_API_KEY=your-gemini-api-key
-GEMINI_MODEL=gemini-flash-lite-latest
+GEMINI_MODEL=gemini-3.5-flash
 STOCK_RESEARCHER_PORT=8765
 ```
 
@@ -122,6 +195,7 @@ EMBEDDING_DEVICE=cpu
 EMBEDDING_BATCH_SIZE=16
 RAG_CHUNK_SIZE=2500
 RAG_CHUNK_OVERLAP=350
+RAG_MIN_SIMILARITY_SCORE=0.30
 DDG_RESULTS_PER_QUERY=5
 DDG_SEARCH_TIMEOUT_SECONDS=15
 ```
@@ -157,54 +231,6 @@ python -m stock_screener_filter.screener_login --browser-channel chromium --manu
 
 If Screener login or custom ratios behave differently in one browser, use the
 browser where your Screener setup works reliably.
-
-## Screener Setup
-
-The scraper depends on Screener's company profile quick-ratio card. Configure
-your Screener company profile so the quick-ratio section matches this format:
-
-![Required Screener company profile quick-ratio format](<docs/images/Screenshot 2026-07-24 053742.png>)
-
-At minimum, these ratios must be visible with these exact names:
-
-```text
-Stock P/E
-Industry PE
-3Yrs PE
-5Yrs PE
-7Yrs PE
-ROCE
-ROE
-Debt to equity
-DPR YOY
-Pledged percentage
-Promoter holding
-```
-
-Add this custom ratio in Screener:
-
-```text
-Ratio name: DPR YOY
-Short name: DPR YOY
-Ratio unit: Percentage
-Formula: ((Depreciation -Depreciation last year)/Depreciation last year)*100
-Description: Depreciation -Depreciation last year
-```
-
-Important: configure this in the same browser profile used by the scraper. The
-easiest way is:
-
-```bash
-python -m stock_screener_filter.screener_login --manual --keep-open
-```
-
-In the opened browser window:
-
-1. Log in to Screener.
-2. Open any company page.
-3. Configure the quick-ratio card.
-4. Confirm the required labels are visible.
-5. Press `Ctrl+C` in the terminal when done.
 
 ## Screener Screens
 
@@ -273,6 +299,12 @@ http://127.0.0.1:8765
 ```
 
 Click **Run Screener Pipeline**.
+
+Expect the Screener scraping stage to take time. A full run can take around 30
+minutes or more depending on the number of companies, internet speed, and
+Screener response time. This is intentional: the crawler makes requests one at a
+time and keeps delays between requests so it does not hit Screener too
+aggressively or trigger temporary throttling.
 
 The app will:
 
@@ -347,12 +379,8 @@ python -m stock_screener_filter.company_profile_crawler --screen-dir "C:\path wi
 After the quantitative pipeline finishes, the UI shows the stocks that passed
 the rule filter.
 
-For each stock, you can upload:
-
-- Annual reports
-- Concall transcripts
-- Quarterly reports
-- Text, HTML, CSV, JSON, or PDF files
+For each stock, you can upload reports or concalls in PDF, text, HTML, CSV, JSON,
+or Markdown format.
 
 During upload, the app:
 
@@ -373,21 +401,68 @@ pages=14,15
 So answers can cite:
 
 ```text
-Annual Report FY25, pp. 14-15
+Report FY25, pp. 14-15
 ```
 
-When uploading, you can optionally enter:
+You can upload multiple documents for the same stock in one action. After you
+select files, the UI creates one metadata row per file. For every document,
+select:
 
-- Year
-- Quarter
+- Document type: report or concall
+- Year: FY format, such as FY2026
+- Quarter/period: FY, Q1, Q2, Q3, or Q4
 
-Annual reports usually only need year. Quarterly reports can use year and
-quarter. These metadata fields can later be used as filters when asking
-questions.
+Annual reports should be uploaded as `Report` with period `FY`. Quarterly
+concall transcripts should be uploaded as `Concall` with the relevant quarter.
+These metadata fields are mandatory and are stored on each vector chunk, which
+helps the app retrieve the right evidence when your question mentions a document
+type or period.
 
 The **Ask Documents** box lets you ask custom questions against a stock's
 uploaded knowledge base. Answers are based only on retrieved document chunks and
-include citations.
+include citations. You do not need to manually choose filters while asking. If
+your question says something like `FY25`, `2025`, `Mar-25`, `Q2 FY25`,
+`compare 2023 with 2024`, `from the report`, or `in the concall`, the app
+infers the explicit periods and document types from the question and first tries
+to retrieve matching uploaded documents. If no matching chunks are found, it
+falls back to searching all uploaded documents for that stock. Relative phrases
+such as `latest quarter` or `previous year` are not resolved yet.
+
+When the app starts, the stock table includes both:
+
+- Stocks from the current 75% rule-filtered output.
+- Stocks that already have at least one uploaded document in
+  `data/document_store/documents.json`.
+
+That means you can ask document Q&A for previously uploaded stocks without
+rerunning the Screener pipeline. AI scoring is still intended for rule-filtered
+stocks because it combines the quantitative rule score with qualitative RAG
+analysis.
+
+### Document Q&A Observability
+
+Every **Ask Documents** request creates a local trace JSON file under:
+
+```text
+data/qa_runs/
+```
+
+The UI also shows an expandable **Trace** panel below each answer. Use this to
+debug whether the answer is trustworthy. It includes:
+
+- Inferred metadata filters.
+- Whether the app had to fall back from filtered retrieval to all documents.
+- Raw retrieved chunks, accepted chunks sent to Gemini, and chunks rejected by
+  the similarity threshold.
+- Source IDs, page ranges, document metadata, and similarity scores.
+- Which retrieved chunks Gemini cited and which retrieved chunks it ignored.
+- The exact prompt sent to Gemini.
+- Parsed model response, raw model text, and raw API payload.
+
+This is the main debugging path for RAG accuracy. If an answer looks wrong,
+first check whether the right chunks were retrieved and whether the
+`RAG_MIN_SIMILARITY_SCORE` threshold is too strict or too loose. If retrieval
+looks good but the answer is weak, inspect the prompt and the cited source IDs.
 
 The **Evaluate** button runs the qualitative AI analysis for a stock. The
 question-by-question workflow is:
@@ -579,6 +654,10 @@ Increase delays:
 
 Avoid rerunning large crawls repeatedly in a short period.
 
+The scraper is deliberately conservative. Large runs can take around 30 minutes
+or more because the app spaces out requests to reduce the chance of Screener
+temporarily blocking or throttling your connection.
+
 ### First document upload is slow
 
 The first RAG upload may download the `BAAI/bge-m3` embedding model into:
@@ -595,7 +674,7 @@ Check `.env`:
 
 ```env
 GEMINI_API_KEY=your-gemini-api-key
-GEMINI_MODEL=gemini-flash-lite-latest
+GEMINI_MODEL=gemini-3.5-flash
 ```
 
 Restart the app after changing `.env`.

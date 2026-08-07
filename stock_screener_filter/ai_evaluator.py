@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -20,11 +20,12 @@ from stock_screener_filter import document_store
 load_env()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AI_DIR = PROJECT_ROOT / "data" / "ai_evaluations"
+QA_RUNS_DIR = PROJECT_ROOT / "data" / "qa_runs"
 SEARCH_CACHE_DIR = PROJECT_ROOT / "data" / "search_cache"
-DEFAULT_MODEL = "gemini-flash-lite-latest"
+DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MIN_RAG_SIMILARITY_SCORE = 0.30
 LEGACY_MODEL_ALIASES = {
     "gemini-2.5-flash": DEFAULT_MODEL,
-    "gemini-3.5-flash": DEFAULT_MODEL,
 }
 GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -138,6 +139,19 @@ DOCUMENT_QA_RESPONSE_SCHEMA: dict[str, Any] = {
         "limitations": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["answer", "citation_source_ids", "limitations"],
+}
+
+
+DOCUMENT_FILTER_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "apply_metadata_filter": {"type": "boolean"},
+        "document_years": {"type": "array", "items": {"type": "string"}},
+        "document_quarters": {"type": "array", "items": {"type": "string"}},
+        "document_types": {"type": "array", "items": {"type": "string"}},
+        "reason": {"type": "string"},
+    },
+    "required": ["apply_metadata_filter", "document_years", "document_quarters", "document_types", "reason"],
 }
 
 
@@ -414,6 +428,7 @@ def format_document_qa_context(chunks: list[dict[str, Any]]) -> tuple[str, dict[
         lines.append(
             f"[{source_id}]\n"
             f"Document: {chunk.get('filename', '')}\n"
+            f"Type: {chunk.get('document_type', '')}\n"
             f"Pages: {page_label(chunk)}\n"
             f"Year: {chunk.get('document_year', '')}\n"
             f"Quarter: {chunk.get('document_quarter', '')}\n"
@@ -428,21 +443,17 @@ def build_document_qa_prompt(
     stock: dict[str, Any],
     question: str,
     context: str,
-    document_year: str = "",
-    document_quarter: str = "",
+    inferred_filters: dict[str, str] | None = None,
 ) -> str:
-    filters = {
-        "document_year": document_year or "all uploaded years",
-        "document_quarter": document_quarter or "all uploaded quarters",
-    }
+    filters = inferred_filters or {}
     return f"""
 You are answering a user's question about {stock.get('company_name', 'the company')} using only uploaded document excerpts.
 
 Question:
 {question}
 
-Metadata filters applied:
-{json.dumps(filters, indent=2)}
+Metadata inferred from the question:
+{json.dumps(filters or {"document_year": "not specified", "document_quarter": "not specified"}, indent=2)}
 
 Evidence excerpts:
 {context}
@@ -628,6 +639,140 @@ def validate_evaluation(parsed: dict[str, Any], stock: dict[str, Any]) -> dict[s
     return result
 
 
+def regex_document_filters(question: str) -> dict[str, list[str]]:
+    normalized = question.upper()
+    years: set[str] = set()
+    quarters: set[str] = set()
+    document_types: set[str] = set()
+
+    for quarter_match in re.finditer(r"\bQ([1-4])\b", normalized):
+        quarters.add(f"Q{quarter_match.group(1)}")
+
+    for fy_match in re.finditer(r"\bFY\s*[-']?\s*(20)?(\d{2})\b", normalized):
+        years.add(f"FY20{fy_match.group(2)}")
+
+    for year_match in re.finditer(r"\b(20\d{2})\b", normalized):
+        years.add(f"FY{year_match.group(1)}")
+
+    for short_year_match in re.finditer(r"\b(?:MAR|JUN|SEP|SEPT|DEC)\s*[-']?\s*(\d{2})\b", normalized):
+        years.add(f"FY20{short_year_match.group(1)}")
+
+    if re.search(r"\bANNUAL\s+REPORTS?\b|\bANNUAL\s+RESULTS?\b", normalized):
+        document_types.add("report")
+        quarters.add("FY")
+    if re.search(r"\bQUARTERLY\s+REPORTS?\b|\bQUARTERLY\s+RESULTS?\b", normalized):
+        document_types.add("report")
+    if re.search(r"\bCONCALLS?\b|\bCONFERENCE\s+CALLS?\b|\bEARNINGS\s+CALLS?\b", normalized):
+        document_types.add("concall")
+    if re.search(r"\bREPORTS?\b", normalized):
+        document_types.add("report")
+
+    return {
+        "document_years": sorted(years),
+        "document_quarters": sorted(quarters),
+        "document_types": sorted(document_types),
+    }
+
+
+def normalize_filter_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    years = []
+    for year in payload.get("document_years", []) or []:
+        digits = re.sub(r"\D", "", str(year))
+        if len(digits) == 2:
+            digits = f"20{digits}"
+        if len(digits) == 4:
+            years.append(f"FY{digits}")
+
+    quarters = []
+    for quarter in payload.get("document_quarters", []) or []:
+        text = str(quarter).upper()
+        if re.search(r"\bFY(?:\b|\d{2,4})|\bFULL\s+YEAR\b|\bANNUAL\b", text):
+            quarters.append("FY")
+            continue
+        match = re.search(r"\bQ([1-4])\b", text)
+        if match:
+            quarters.append(f"Q{match.group(1)}")
+
+    valid_types = {"report", "concall"}
+    type_aliases = {
+        "annual": "report",
+        "annual_report": "report",
+        "annual_results": "report",
+        "quarterly": "report",
+        "quarterly_report": "report",
+        "quarterly_results": "report",
+        "results": "report",
+        "report": "report",
+        "concall": "concall",
+        "concall_transcript": "concall",
+        "conference_call": "concall",
+        "earnings_call": "concall",
+    }
+    document_types = []
+    for document_type in payload.get("document_types", []) or []:
+        key = re.sub(r"[^a-z0-9]+", "_", str(document_type).lower()).strip("_")
+        normalized_type = type_aliases.get(key)
+        if normalized_type in valid_types:
+            document_types.append(normalized_type)
+
+    years = sorted(set(years))
+    quarters = sorted(set(quarters))
+    document_types = sorted(set(document_types))
+    return {
+        "apply_metadata_filter": bool(payload.get("apply_metadata_filter")) and bool(years or quarters or document_types),
+        "document_years": years,
+        "document_quarters": quarters,
+        "document_types": document_types,
+        "reason": str(payload.get("reason", "")),
+    }
+
+
+def infer_document_filters(question: str) -> dict[str, Any]:
+    prompt = f"""
+Extract only explicit document-period filters from this user question.
+
+Question:
+{question}
+
+Rules:
+- Extract explicit years such as 2023, 2024, FY24, FY2025, Mar-25, Jun-26.
+- Extract explicit quarter/period values such as FY, Q1, Q2, Q3, Q4.
+- Extract explicit document types: report or concall.
+- If the user asks to compare years, return all mentioned years.
+- If the user asks to compare quarters or periods, return all mentioned quarter/period values.
+- If the user asks for an annual report, return document_quarters as FY.
+- If the user asks about annual reports, quarterly reports, results, or reports in general, return report.
+- If the user asks about concalls, conference calls, or earnings calls, return concall.
+- Do not infer relative periods such as latest, previous, recent, older, last year, or current quarter.
+- If there is no explicit year, quarter, or document type, set apply_metadata_filter to false and return empty arrays.
+- Return document_years as FY plus four digits, for example FY25 becomes FY2025.
+- Return document_quarters using only FY, Q1, Q2, Q3, or Q4.
+- Return document_types using only report or concall.
+""".strip()
+    try:
+        api_key, model = gemini_settings()
+        parsed, _raw_text, _citations, _raw_payload = gemini_json(
+            prompt,
+            api_key,
+            model,
+            DOCUMENT_FILTER_RESPONSE_SCHEMA,
+        )
+        normalized = normalize_filter_payload(parsed)
+        if normalized["apply_metadata_filter"]:
+            return normalized
+    except Exception:
+        pass
+
+    fallback = regex_document_filters(question)
+    return {
+        "apply_metadata_filter": bool(
+            fallback["document_years"] or fallback["document_quarters"] or fallback["document_types"]
+        ),
+        **fallback,
+        "reason": "Inferred with deterministic fallback.",
+    }
+
+
 def analyze_question(state: EvaluationState, spec: QuestionSpec) -> EvaluationState:
     chunks = retrieve_chunks(state["stock_id"], spec.retrieval_queries) if spec.retrieval_queries else []
     search_results = external_search_results(state["stock"], spec) if spec.search_kind != "none" else []
@@ -811,41 +956,208 @@ def current_evaluation(stock_id: str) -> dict[str, Any] | None:
     return evaluation
 
 
+def qa_trace_chunks(source_map: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    traced_chunks: list[dict[str, Any]] = []
+    for source_id, chunk in source_map.items():
+        text = str(chunk.get("text", ""))
+        traced_chunks.append(
+            {
+                "source_id": source_id,
+                "document_name": chunk.get("filename", ""),
+                "document_sha": chunk.get("document_sha", ""),
+                "chunk_index": chunk.get("chunk_index", ""),
+                "page_start": chunk.get("page_start", ""),
+                "page_end": chunk.get("page_end", ""),
+                "document_year": chunk.get("document_year", ""),
+                "document_quarter": chunk.get("document_quarter", ""),
+                "document_type": chunk.get("document_type", ""),
+                "similarity_score": round(float(chunk.get("score", 0) or 0), 3),
+                "text_chars": len(text),
+                "text_excerpt": text[:1800] + ("..." if len(text) > 1800 else ""),
+            }
+        )
+    return traced_chunks
+
+
+def save_qa_trace(stock_id: str, trace: dict[str, Any]) -> dict[str, str]:
+    QA_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    stock_dir = QA_RUNS_DIR / safe_name(stock_id)
+    stock_dir.mkdir(parents=True, exist_ok=True)
+    created_at = datetime.now().isoformat(timespec="seconds")
+    trace_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_name(stock_id)}"
+    trace = {
+        "trace_id": trace_id,
+        "created_at": created_at,
+        **trace,
+    }
+    path = stock_dir / f"{trace_id}.json"
+    path.write_text(json.dumps(trace, indent=2), encoding="utf-8")
+    return {
+        "trace_id": trace_id,
+        "trace_path": str(path.relative_to(PROJECT_ROOT)),
+    }
+
+
+def min_rag_similarity_score() -> float:
+    load_env()
+    try:
+        return float(os.environ.get("RAG_MIN_SIMILARITY_SCORE", str(DEFAULT_MIN_RAG_SIMILARITY_SCORE)))
+    except ValueError:
+        return DEFAULT_MIN_RAG_SIMILARITY_SCORE
+
+
+def split_chunks_by_similarity(chunks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    threshold = min_rag_similarity_score()
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for chunk in chunks:
+        score = float(chunk.get("score", 0) or 0)
+        if score >= threshold:
+            accepted.append(chunk)
+        else:
+            rejected.append(chunk)
+    return accepted, rejected, threshold
+
+
 def answer_document_question(
     stock: dict[str, Any],
     question: str,
-    document_year: str = "",
-    document_quarter: str = "",
 ) -> dict[str, Any]:
     question = question.strip()
     if not question:
         raise RuntimeError("Question is required.")
 
     stock_id = str(stock["stock_id"])
+    inferred_filters = infer_document_filters(question)
     chunks = document_store.search_chunks(
         stock_id,
         question,
         limit=8,
-        document_year=document_year.strip(),
-        document_quarter=document_quarter.strip(),
+        document_years=inferred_filters.get("document_years", []),
+        document_quarters=inferred_filters.get("document_quarters", []),
+        document_types=inferred_filters.get("document_types", []),
     )
+    used_filter_fallback = False
+    if not chunks and inferred_filters.get("apply_metadata_filter"):
+        used_filter_fallback = True
+        chunks = document_store.search_chunks(stock_id, question, limit=8)
+
+    raw_retrieved_chunks = list(chunks)
+    chunks, rejected_chunks, similarity_threshold = split_chunks_by_similarity(raw_retrieved_chunks)
+    raw_source_map = {f"S{index}": chunk for index, chunk in enumerate(raw_retrieved_chunks, start=1)}
+    rejected_source_map = {f"R{index}": chunk for index, chunk in enumerate(rejected_chunks, start=1)}
+    raw_traced_chunks = qa_trace_chunks(raw_source_map)
+    rejected_traced_chunks = qa_trace_chunks(rejected_source_map)
+
     if not chunks:
+        answer = (
+            "No matching uploaded document chunks were found for this question."
+            if not raw_retrieved_chunks
+            else "No sufficiently relevant uploaded document chunks were found for this question."
+        )
+        limitation = (
+            "Upload relevant documents for this stock and try again."
+            if not raw_retrieved_chunks
+            else f"The nearest retrieved chunks were below the similarity threshold of {similarity_threshold:.2f}."
+        )
+        trace_info = save_qa_trace(
+            stock_id,
+            {
+                "stock": {
+                    "stock_id": stock_id,
+                    "company_name": stock.get("company_name", ""),
+                    "stock_source": stock.get("stock_source", ""),
+                },
+                "question": question,
+                "inferred_filters": inferred_filters,
+                "used_filter_fallback": used_filter_fallback,
+                "similarity_threshold": similarity_threshold,
+                "raw_retrieved_chunk_count": len(raw_retrieved_chunks),
+                "raw_retrieved_chunks": raw_traced_chunks,
+                "rejected_chunk_count": len(rejected_chunks),
+                "rejected_chunks": rejected_traced_chunks,
+                "retrieved_chunk_count": 0,
+                "retrieved_chunks": [],
+                "prompt": "",
+                "model": "",
+                "parsed_response": {
+                    "answer": answer,
+                    "citation_source_ids": [],
+                    "limitations": [limitation],
+                },
+                "raw_model_text": "",
+                "raw_payload": {},
+                "status": "no_chunks" if not raw_retrieved_chunks else "below_similarity_threshold",
+            },
+        )
         return {
-            "answer": "No matching uploaded document chunks were found for this question and filter.",
+            "answer": answer,
             "citations": [],
-            "limitations": ["Upload relevant documents or remove the year/quarter filter and try again."],
+            "limitations": [limitation],
             "retrieved_chunk_count": 0,
+            "inferred_filters": inferred_filters,
+            "trace": {
+                **trace_info,
+                "inferred_filters": inferred_filters,
+                "used_filter_fallback": used_filter_fallback,
+                "similarity_threshold": similarity_threshold,
+                "raw_retrieved_chunk_count": len(raw_retrieved_chunks),
+                "raw_retrieved_chunks": raw_traced_chunks,
+                "rejected_chunk_count": len(rejected_chunks),
+                "rejected_chunks": rejected_traced_chunks,
+                "retrieved_chunks": [],
+                "prompt": "",
+                "parsed_response": {
+                    "answer": answer,
+                    "citation_source_ids": [],
+                    "limitations": [limitation],
+                },
+                "raw_model_text": "",
+                "raw_payload": {},
+                "status": "no_chunks" if not raw_retrieved_chunks else "below_similarity_threshold",
+            },
         }
 
     context, source_map = format_document_qa_context(chunks)
-    prompt = build_document_qa_prompt(stock, question, context, document_year, document_quarter)
+    prompt = build_document_qa_prompt(stock, question, context, inferred_filters)
     api_key, model = gemini_settings()
-    parsed, raw_text, _citations, raw_payload = gemini_json(
-        prompt,
-        api_key,
-        model,
-        DOCUMENT_QA_RESPONSE_SCHEMA,
-    )
+    traced_chunks = qa_trace_chunks(source_map)
+    try:
+        parsed, raw_text, _citations, raw_payload = gemini_json(
+            prompt,
+            api_key,
+            model,
+            DOCUMENT_QA_RESPONSE_SCHEMA,
+        )
+    except Exception as exc:
+        trace_info = save_qa_trace(
+            stock_id,
+            {
+                "stock": {
+                    "stock_id": stock_id,
+                    "company_name": stock.get("company_name", ""),
+                    "stock_source": stock.get("stock_source", ""),
+                },
+                "question": question,
+                "inferred_filters": inferred_filters,
+                "used_filter_fallback": used_filter_fallback,
+                "similarity_threshold": similarity_threshold,
+                "raw_retrieved_chunk_count": len(raw_retrieved_chunks),
+                "raw_retrieved_chunks": raw_traced_chunks,
+                "rejected_chunk_count": len(rejected_chunks),
+                "rejected_chunks": rejected_traced_chunks,
+                "retrieved_chunk_count": len(chunks),
+                "retrieved_chunks": traced_chunks,
+                "prompt": prompt,
+                "model": model,
+                "parsed_response": {},
+                "raw_model_text": "",
+                "raw_payload": {},
+                "status": "model_error",
+                "error": str(exc),
+            },
+        )
+        raise RuntimeError(f"Document QA failed. Trace saved at {trace_info['trace_path']}. {exc}") from exc
 
     citations: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -865,16 +1177,74 @@ def answer_document_question(
                 "page_end": page_end if page_end else None,
                 "document_year": chunk.get("document_year", ""),
                 "document_quarter": chunk.get("document_quarter", ""),
+                "document_type": chunk.get("document_type", ""),
                 "chunk_index": chunk.get("chunk_index", ""),
                 "similarity_score": round(float(chunk.get("score", 0) or 0), 3),
             }
         )
+
+    cited_source_ids = {str(citation.get("source_id", "")) for citation in citations}
+    ignored_source_ids = [
+        str(chunk.get("source_id", ""))
+        for chunk in traced_chunks
+        if str(chunk.get("source_id", "")) not in cited_source_ids
+    ]
+    trace_info = save_qa_trace(
+        stock_id,
+        {
+            "stock": {
+                "stock_id": stock_id,
+                "company_name": stock.get("company_name", ""),
+                "stock_source": stock.get("stock_source", ""),
+            },
+            "question": question,
+            "inferred_filters": inferred_filters,
+            "used_filter_fallback": used_filter_fallback,
+            "similarity_threshold": similarity_threshold,
+            "raw_retrieved_chunk_count": len(raw_retrieved_chunks),
+            "raw_retrieved_chunks": raw_traced_chunks,
+            "rejected_chunk_count": len(rejected_chunks),
+            "rejected_chunks": rejected_traced_chunks,
+            "retrieved_chunk_count": len(chunks),
+            "retrieved_chunks": traced_chunks,
+            "cited_source_ids": sorted(cited_source_ids),
+            "ignored_source_ids": ignored_source_ids,
+            "prompt": prompt,
+            "model": model,
+            "parsed_response": parsed,
+            "raw_model_text": raw_text,
+            "raw_payload": raw_payload,
+            "status": "complete",
+        },
+    )
 
     return {
         "answer": str(parsed.get("answer", "")),
         "citations": citations,
         "limitations": parsed.get("limitations", []) or [],
         "retrieved_chunk_count": len(chunks),
+        "inferred_filters": inferred_filters,
+        "used_filter_fallback": used_filter_fallback,
         "raw_model_text": raw_text,
         "raw_payload": raw_payload,
+        "trace": {
+            **trace_info,
+            "model": model,
+            "inferred_filters": inferred_filters,
+            "used_filter_fallback": used_filter_fallback,
+            "similarity_threshold": similarity_threshold,
+            "raw_retrieved_chunk_count": len(raw_retrieved_chunks),
+            "raw_retrieved_chunks": raw_traced_chunks,
+            "rejected_chunk_count": len(rejected_chunks),
+            "rejected_chunks": rejected_traced_chunks,
+            "retrieved_chunk_count": len(chunks),
+            "retrieved_chunks": traced_chunks,
+            "cited_source_ids": sorted(cited_source_ids),
+            "ignored_source_ids": ignored_source_ids,
+            "prompt": prompt,
+            "parsed_response": parsed,
+            "raw_model_text": raw_text,
+            "raw_payload": raw_payload,
+            "status": "complete",
+        },
     }

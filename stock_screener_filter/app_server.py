@@ -22,13 +22,33 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
 
+def load_visible_stocks() -> list[dict[str, Any]]:
+    stocks_by_id: dict[str, dict[str, Any]] = {}
+    for stock in rules_pipeline.load_current_rule_filtered():
+        stock_id = str(stock["stock_id"])
+        stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
+
+    for stock in document_store.stocks_with_documents():
+        stock_id = str(stock["stock_id"])
+        if stock_id not in stocks_by_id:
+            stocks_by_id[stock_id] = dict(stock)
+
+    return sorted(
+        stocks_by_id.values(),
+        key=lambda stock: (
+            0 if stock.get("stock_source") == "rule_filtered" else 1,
+            str(stock.get("company_name", "")).lower(),
+        ),
+    )
+
+
 class AppState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.running = False
         self.phase = "idle"
         self.logs: list[str] = []
-        self.stocks: list[dict[str, Any]] = rules_pipeline.load_current_rule_filtered()
+        self.stocks: list[dict[str, Any]] = load_visible_stocks()
         self.error: str | None = None
         self.error_trace: str | None = None
         self.progress_current = 0
@@ -43,7 +63,7 @@ class AppState:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             if not self.running:
-                disk_stocks = rules_pipeline.load_current_rule_filtered()
+                disk_stocks = load_visible_stocks()
                 if disk_stocks:
                     self.stocks = disk_stocks
                 steps = rules_pipeline.pipeline_status()
@@ -124,7 +144,7 @@ def run_pipeline_background() -> None:
     try:
         stocks = rules_pipeline.run_full_pipeline(STATE.log, progress=STATE.progress)
         with STATE.lock:
-            STATE.stocks = stocks
+            STATE.stocks = load_visible_stocks()
             STATE.phase = "pipeline complete"
             STATE.current_step = "Upload documents for filtered stocks"
     except Exception as exc:
@@ -154,9 +174,9 @@ def run_step_background(step_id: str) -> None:
         stocks = rules_pipeline.run_step(step_id, STATE.log, progress=STATE.progress)
         with STATE.lock:
             if stocks:
-                STATE.stocks = stocks
+                STATE.stocks = load_visible_stocks()
             else:
-                STATE.stocks = rules_pipeline.load_current_rule_filtered()
+                STATE.stocks = load_visible_stocks()
             STATE.phase = f"step complete: {step_id}"
             STATE.current_step = "Step complete"
     except Exception as exc:
@@ -180,7 +200,17 @@ def evaluate_background(stock_id: str | None) -> None:
         STATE.error_trace = None
         stocks = list(STATE.stocks)
     try:
-        selected = [stock for stock in stocks if not stock_id or stock["stock_id"] == stock_id]
+        selected = [
+            stock
+            for stock in stocks
+            if (not stock_id or stock["stock_id"] == stock_id) and stock.get("stock_source") == "rule_filtered"
+        ]
+        if not selected:
+            STATE.log("No rule-filtered stocks selected for AI evaluation.")
+            with STATE.lock:
+                STATE.phase = "AI evaluation skipped"
+                STATE.current_step = "No rule-filtered stocks selected"
+            return
         for index, stock in enumerate(selected, start=1):
             current = ai_evaluator.current_evaluation(str(stock["stock_id"]))
             action = "Using cached AI evaluation" if current else "AI evaluating"
@@ -282,25 +312,53 @@ class Handler(BaseHTTPRequestHandler):
             )
             stock_id = form.getfirst("stock_id", "")
             company_name = form.getfirst("company_name", "")
-            document_year = form.getfirst("document_year", "").strip()
-            document_quarter = form.getfirst("document_quarter", "").strip()
             if not stock_id or "file" not in form:
                 self.send_json({"ok": False, "error": "stock_id and file are required."}, status=400)
                 return
             files = form["file"]
             if not isinstance(files, list):
                 files = [files]
+            files = [item for item in files if item.filename]
+            document_types = [str(item).strip() for item in form.getlist("document_type")]
+            document_years = [str(item).strip() for item in form.getlist("document_year")]
+            document_quarters = [str(item).strip().upper() for item in form.getlist("document_quarter")]
+            if not files:
+                self.send_json({"ok": False, "error": "At least one file is required."}, status=400)
+                return
+            if not (
+                len(document_types) == len(files)
+                and len(document_years) == len(files)
+                and len(document_quarters) == len(files)
+            ):
+                self.send_json(
+                    {"ok": False, "error": "Each uploaded document must have document type, year, and quarter/period."},
+                    status=400,
+                )
+                return
+            missing_metadata = [
+                index + 1
+                for index in range(len(files))
+                if not document_types[index] or not document_years[index] or not document_quarters[index]
+            ]
+            if missing_metadata:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": f"Missing document metadata for file row(s): {', '.join(str(item) for item in missing_metadata)}.",
+                    },
+                    status=400,
+                )
+                return
             stored = []
-            for item in files:
-                if not item.filename:
-                    continue
+            for index, item in enumerate(files):
                 stored_doc = document_store.save_upload(
                     stock_id,
                     company_name,
                     item.filename,
                     item.file,
-                    document_year=document_year,
-                    document_quarter=document_quarter,
+                    document_type=document_types[index],
+                    document_year=document_years[index],
+                    document_quarter=document_quarters[index],
                 )
                 stored.append(stored_doc.__dict__)
             self.send_json({"ok": True, "documents": stored})
@@ -318,13 +376,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length) or b"{}")
             stock_id = str(payload.get("stock_id", ""))
             question = str(payload.get("question", ""))
-            document_year = str(payload.get("document_year", "")).strip()
-            document_quarter = str(payload.get("document_quarter", "")).strip()
             if not stock_id or not question.strip():
                 self.send_json({"ok": False, "error": "stock_id and question are required."}, status=400)
                 return
             with STATE.lock:
-                stocks = list(STATE.stocks) or rules_pipeline.load_current_rule_filtered()
+                stocks = list(STATE.stocks) or load_visible_stocks()
             stock = next((item for item in stocks if str(item.get("stock_id")) == stock_id), None)
             if not stock:
                 self.send_json({"ok": False, "error": f"Unknown stock: {stock_id}"}, status=404)
@@ -332,8 +388,6 @@ class Handler(BaseHTTPRequestHandler):
             answer = ai_evaluator.answer_document_question(
                 stock,
                 question,
-                document_year=document_year,
-                document_quarter=document_quarter,
             )
             self.send_json({"ok": True, "answer": answer})
         except Exception as exc:
@@ -374,168 +428,412 @@ INDEX_HTML = r"""
   <style>
     :root {
       color-scheme: light;
-      --bg: #f7f7f4;
+      --bg: #f6f7f8;
       --panel: #ffffff;
-      --ink: #202124;
-      --muted: #626b74;
-      --line: #d9ded8;
-      --accent: #176b5f;
-      --accent-strong: #0d4f45;
-      --warn: #9a5b05;
-      --bad: #a7332f;
+      --panel-soft: #fafafa;
+      --ink: #171717;
+      --muted: #6b7280;
+      --muted-strong: #4b5563;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --accent: #111827;
+      --accent-soft: #f3f4f6;
+      --good: #12715b;
+      --warn: #9a6700;
+      --bad: #b42318;
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --radius: 8px;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: Arial, Helvetica, sans-serif;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
       color: var(--ink);
+      font-size: 13px;
+      line-height: 1.45;
     }
     header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 16px 22px;
+      gap: 16px;
+      padding: 14px 24px;
       border-bottom: 1px solid var(--line);
-      background: #ffffff;
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(10px);
       position: sticky;
       top: 0;
       z-index: 2;
     }
-    h1 { font-size: 20px; margin: 0; }
+    h1 {
+      font-size: 16px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
     main {
       display: grid;
-      grid-template-columns: 320px 1fr;
-      min-height: calc(100vh - 65px);
+      grid-template-columns: 300px minmax(0, 1fr);
+      min-height: calc(100vh - 57px);
     }
     aside {
-      padding: 18px;
+      padding: 18px 16px;
       border-right: 1px solid var(--line);
-      background: #fbfbf9;
+      background: #ffffff;
     }
-    section { padding: 18px 22px; }
+    section {
+      min-width: 0;
+      padding: 18px 22px 28px;
+    }
     button {
       border: 1px solid var(--accent);
       background: var(--accent);
       color: #fff;
-      height: 36px;
-      padding: 0 12px;
+      min-height: 32px;
+      padding: 0 11px;
       border-radius: 6px;
       cursor: pointer;
-      font-weight: 700;
+      font-weight: 600;
+      font-size: 12px;
+      letter-spacing: 0;
+      transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+    }
+    button:hover:not(:disabled) {
+      background: #000000;
+      border-color: #000000;
+    }
+    button:active:not(:disabled) {
+      transform: translateY(1px);
     }
     button.secondary {
       background: #fff;
-      color: var(--accent);
+      color: var(--ink);
+      border-color: var(--line-strong);
+    }
+    button.secondary:hover:not(:disabled) {
+      background: var(--accent-soft);
+      border-color: var(--line-strong);
     }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     input[type="password"], input[type="text"], input[type="number"], textarea, select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 8px 10px;
+      padding: 7px 9px;
       background: #fff;
+      color: var(--ink);
+      font: inherit;
+      outline: none;
     }
-    input[type="password"], input[type="text"], input[type="number"], select { height: 34px; padding-top: 0; padding-bottom: 0; }
-    textarea { min-height: 64px; resize: vertical; font-family: inherit; }
-    label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
-    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+    input[type="password"]:focus, input[type="text"]:focus, input[type="number"]:focus, textarea:focus, select:focus {
+      border-color: #9ca3af;
+      box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.06);
+    }
+    input[type="password"], input[type="text"], input[type="number"], select {
+      height: 32px;
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+    input[type="file"] {
+      width: 100%;
+      color: var(--muted);
+      font: inherit;
+      font-size: 12px;
+    }
+    input[type="file"]::file-selector-button {
+      height: 30px;
+      margin-right: 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    input[type="file"]::file-selector-button:hover {
+      background: var(--accent-soft);
+    }
+    textarea {
+      min-height: 70px;
+      resize: vertical;
+      font-family: inherit;
+    }
+    summary {
+      cursor: pointer;
+      user-select: none;
+      font-weight: 600;
+    }
+    label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin: 16px 0 7px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
     .step-list {
       display: grid;
-      gap: 8px;
-      margin-top: 14px;
+      gap: 7px;
+      margin-top: 10px;
     }
     .step-row {
       border: 1px solid var(--line);
       background: var(--panel);
-      border-radius: 8px;
-      padding: 9px;
+      border-radius: var(--radius);
+      padding: 10px;
       display: grid;
       grid-template-columns: 1fr auto;
-      gap: 8px;
+      gap: 10px;
       align-items: center;
+      box-shadow: var(--shadow);
     }
     .step-title {
-      font-weight: 700;
+      font-weight: 650;
       font-size: 13px;
     }
     .step-summary {
-      margin-top: 3px;
+      margin-top: 2px;
       color: var(--muted);
       font-size: 12px;
     }
     .step-check {
-      color: #116149;
-      font-weight: 900;
-      margin-right: 5px;
+      color: var(--good);
+      font-weight: 800;
+      margin-right: 6px;
     }
     .status {
-      margin-top: 16px;
+      margin-top: 14px;
       padding: 12px;
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: var(--radius);
       background: var(--panel);
       font-size: 13px;
       color: var(--muted);
+      box-shadow: var(--shadow);
+    }
+    .status strong {
+      color: var(--muted-strong);
+      font-weight: 600;
     }
     pre {
       max-height: 260px;
       overflow: auto;
       padding: 12px;
-      border: 1px solid var(--line);
-      background: #101514;
-      color: #edf5f1;
-      border-radius: 8px;
+      border: 1px solid #1f2937;
+      background: #0b0f16;
+      color: #e5e7eb;
+      border-radius: var(--radius);
       font-size: 12px;
+      line-height: 1.5;
       white-space: pre-wrap;
     }
     table {
       width: 100%;
-      border-collapse: collapse;
+      border-collapse: separate;
+      border-spacing: 0;
       background: var(--panel);
       border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
     }
     th, td {
       border-bottom: 1px solid var(--line);
-      padding: 9px 10px;
+      padding: 12px;
       text-align: left;
       vertical-align: top;
       font-size: 13px;
     }
-    th { background: #eef3ef; color: #2c403b; position: sticky; top: 65px; }
-    .stock-name { font-weight: 700; font-size: 14px; }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover td { background: #fcfcfd; }
+    th {
+      background: #fafafa;
+      color: var(--muted-strong);
+      font-size: 11px;
+      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    th:nth-child(1) { width: 18%; }
+    th:nth-child(2) { width: 14%; }
+    th:nth-child(3) { width: 31%; }
+    th:nth-child(4) { width: 10%; }
+    th:nth-child(5) { width: 27%; }
+    .stock-name {
+      font-weight: 650;
+      font-size: 14px;
+      line-height: 1.3;
+    }
     .muted { color: var(--muted); }
     .badge {
       display: inline-block;
-      padding: 3px 7px;
+      padding: 3px 8px;
       border-radius: 999px;
-      background: #e8f4ef;
-      color: var(--accent-strong);
-      font-weight: 700;
+      background: var(--accent-soft);
+      color: var(--ink);
+      border: 1px solid var(--line);
+      font-weight: 650;
       font-size: 12px;
     }
     .bad { color: var(--bad); }
     .warn { color: var(--warn); }
-    .docs { margin-top: 8px; font-size: 12px; color: var(--muted); }
-    .upload { display: grid; gap: 7px; min-width: 220px; }
-    .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-    .qa-box { margin-top: 12px; display: grid; gap: 7px; min-width: 260px; }
-    .qa-answer {
+    .docs {
       margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .verdict-box {
+      max-width: 520px;
+      line-height: 1.5;
+    }
+    .verdict-text {
+      color: var(--ink);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .reason-list {
+      display: grid;
+      gap: 5px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .reason-list li {
+      padding-left: 10px;
+      border-left: 2px solid var(--line-strong);
+    }
+    .section-breakdown {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .section-card {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fff;
+    }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+    .section-title {
+      font-weight: 650;
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .score-row {
+      display: flex;
+      gap: 5px;
+      flex-wrap: wrap;
+      white-space: nowrap;
+    }
+    .mini-score {
+      display: inline-block;
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--muted-strong);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .section-answer {
+      color: var(--muted-strong);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .upload {
+      display: grid;
+      gap: 8px;
+      min-width: 240px;
+    }
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+    .file-meta {
+      display: grid;
+      gap: 7px;
+    }
+    .file-meta-row {
+      display: grid;
+      grid-template-columns: minmax(120px, 1.2fr) 0.8fr 0.8fr 0.9fr;
+      gap: 6px;
+      align-items: center;
       padding: 8px;
       border: 1px solid var(--line);
       border-radius: 6px;
-      background: #fbfbf9;
+      background: var(--panel-soft);
+    }
+    .file-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .qa-box {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      min-width: 260px;
+    }
+    .qa-answer {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel-soft);
       font-size: 12px;
       white-space: pre-wrap;
     }
+    .qa-trace {
+      margin-top: 8px;
+      white-space: normal;
+    }
+    .trace-grid {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .trace-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 8px;
+      background: #fff;
+    }
+    .trace-pre {
+      max-height: 220px;
+      margin: 6px 0 0;
+      background: #0b0f16;
+      color: #e5e7eb;
+      white-space: pre-wrap;
+      overflow: auto;
+    }
     .progress-shell {
       width: 100%;
-      height: 12px;
-      border: 1px solid var(--line);
+      height: 8px;
       border-radius: 999px;
       overflow: hidden;
-      background: #eef0ec;
+      background: #eef0f2;
       margin: 10px 0 6px;
     }
     .progress-fill {
@@ -544,12 +842,31 @@ INDEX_HTML = r"""
       background: var(--accent);
       transition: width 0.2s ease;
     }
+    .inline-progress {
+      width: 100%;
+      height: 6px;
+      margin: 8px 0;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #eef0f2;
+    }
+    .inline-progress-fill {
+      height: 100%;
+      width: 100%;
+      background: linear-gradient(90deg, #d1d5db, #111827, #d1d5db);
+      background-size: 200% 100%;
+      animation: progress-slide 1.2s linear infinite;
+    }
+    @keyframes progress-slide {
+      from { background-position: 200% 0; }
+      to { background-position: 0 0; }
+    }
     .error-box {
       margin-top: 12px;
-      border: 1px solid #e3b4b1;
-      background: #fff6f5;
+      border: 1px solid #f3b8b3;
+      background: #fff7f7;
       color: var(--bad);
-      border-radius: 8px;
+      border-radius: var(--radius);
       padding: 10px;
       display: none;
       white-space: pre-wrap;
@@ -560,20 +877,21 @@ INDEX_HTML = r"""
       margin-bottom: 14px;
       padding: 12px;
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: var(--radius);
       background: #fff;
       color: var(--muted);
+      box-shadow: var(--shadow);
     }
     .rule-grid {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 5px;
+      gap: 6px;
       margin-top: 8px;
     }
     .rule-chip {
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 4px 6px;
+      padding: 6px 7px;
       font-size: 11px;
       background: #fff;
     }
@@ -582,13 +900,16 @@ INDEX_HTML = r"""
       margin-top: 3px;
       line-height: 1.3;
     }
-    .rule-chip.pass { border-color: #b8d7c8; color: #116149; background: #edf8f2; }
-    .rule-chip.fail { border-color: #e1bbb6; color: var(--bad); background: #fff5f3; }
-    .rule-chip.missing { border-color: #e0c996; color: var(--warn); background: #fff9e8; }
+    .rule-chip.pass { border-color: #c7e4d6; color: var(--good); background: #f3fbf7; }
+    .rule-chip.fail { border-color: #f0c3bf; color: var(--bad); background: #fff7f6; }
+    .rule-chip.missing { border-color: #ecd69b; color: var(--warn); background: #fffaf0; }
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       th { position: static; }
+      .file-meta-row { grid-template-columns: 1fr; }
+      section { padding: 14px; overflow-x: auto; }
+      header { align-items: flex-start; flex-direction: column; }
     }
   </style>
 </head>
@@ -616,7 +937,7 @@ INDEX_HTML = r"""
         <div class="progress-shell"><div id="progressFill" class="progress-fill"></div></div>
         <div><span id="progressText">0%</span></div>
         <div><strong>Running:</strong> <span id="running">false</span></div>
-        <div><strong>Filtered stocks:</strong> <span id="count">0</span></div>
+        <div><strong>Visible stocks:</strong> <span id="count">0</span></div>
         <div id="error" class="bad"></div>
       </div>
       <div id="errorBox" class="error-box"></div>
@@ -625,7 +946,7 @@ INDEX_HTML = r"""
     </aside>
     <section>
       <div id="uploadPrompt" class="prompt">
-        Run the Screener pipeline. Once stocks pass the 75% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.
+        Run the Screener pipeline. Once stocks pass the 75% rule filter, upload reports or concalls here for each stock.
       </div>
       <table>
         <thead>
@@ -644,6 +965,7 @@ INDEX_HTML = r"""
   <script>
     let latest = {};
     let qaAnswers = {};
+    let evaluatingStockId = '';
     const $ = (id) => document.getElementById(id);
 
     async function api(path, options = {}) {
@@ -660,15 +982,22 @@ INDEX_HTML = r"""
       $('progressFill').style.width = `${latest.progress_percent || 0}%`;
       $('progressText').textContent = `${latest.progress_percent || 0}% (${latest.progress_current || 0}/${latest.progress_total || 1})`;
       $('running').textContent = latest.running;
-      $('count').textContent = latest.stocks.length;
+      const ruleFilteredCount = latest.stocks.filter(stock => stock.stock_source === 'rule_filtered').length;
+      const documentOnlyCount = latest.stocks.length - ruleFilteredCount;
+      $('count').textContent = `${latest.stocks.length} (${ruleFilteredCount} filtered, ${documentOnlyCount} document library)`;
       $('error').textContent = latest.error || '';
       $('errorBox').style.display = latest.error ? 'block' : 'none';
       $('errorBox').textContent = latest.error_trace || latest.error || '';
       $('logs').textContent = (latest.logs || []).slice(-120).join('\n');
       $('runBtn').disabled = latest.running;
       $('evalAllBtn').disabled = latest.running || !latest.stocks.length;
+      if (!latest.running) {
+        evaluatingStockId = '';
+      }
       renderSteps(latest.pipeline_steps || []);
-      renderStocks(latest.stocks || []);
+      if (!stockFormInteractionActive()) {
+        renderStocks(latest.stocks || []);
+      }
     }
 
     function renderSteps(steps) {
@@ -705,26 +1034,40 @@ INDEX_HTML = r"""
         Array.from(document.querySelectorAll('details.rule-details[open]'))
           .map(detail => detail.dataset.stock)
       );
+      const openTraces = new Set(
+        Array.from(document.querySelectorAll('details.qa-trace[open]'))
+          .map(detail => detail.dataset.stock)
+      );
       body.innerHTML = '';
       $('uploadPrompt').textContent = stocks.length
-        ? `Upload annual reports, concalls, or quarterly reports for the ${stocks.length} stocks that passed the 75% rule filter. Duplicate files are skipped automatically.`
-        : 'Run the Screener pipeline. Once stocks pass the 75% rule filter, upload annual reports, concalls, or quarterly reports here for each stock.';
+        ? `Upload reports or concalls for filtered stocks and document-library stocks. Duplicate files are skipped automatically.`
+        : 'Run the Screener pipeline or upload documents for stocks already present in the document library.';
       for (const stock of stocks) {
         const tr = document.createElement('tr');
         const docs = stock.documents || [];
         const ai = stock.ai_evaluation || {};
         const rules = stock.rule_details || ruleDetailsFromStock(stock);
+        const isRuleFiltered = stock.stock_source === 'rule_filtered';
+        const reasons = ai.key_reasons || [];
+        const isEvaluating = evaluatingStockId && evaluatingStockId === stock.stock_id && latest.running;
+        const sectionBreakdown = renderSectionBreakdown(ai.section_analyses || {});
         tr.innerHTML = `
           <td>
             <div class="stock-name">${escapeHtml(stock.company_name)}</div>
             <div class="muted">${escapeHtml(stock.market_categories || '')}</div>
             <div class="muted">${escapeHtml(stock.company_url || '')}</div>
+            <div class="muted">${isRuleFiltered ? 'Rule filtered' : 'Document library'}</div>
           </td>
           <td>
-            <span class="badge">${stock.total_rule_pass_count}/${stock.total_rule_count}</span>
-            <div class="muted">${stock.rule_pass_percentage}% passed</div>
-            <div class="muted">Rule score: ${stock.rule_score_out_of_50}/50</div>
-            <details class="rule-details" data-stock="${escapeAttr(stock.stock_id)}" ${openDetails.has(stock.stock_id) ? 'open' : ''}>
+            ${isRuleFiltered ? `
+              <span class="badge">${stock.total_rule_pass_count}/${stock.total_rule_count}</span>
+              <div class="muted">${stock.rule_pass_percentage}% passed</div>
+              <div class="muted">Rule score: ${stock.rule_score_out_of_50}/50</div>
+            ` : `
+              <span class="badge">Documents</span>
+              <div class="muted">No current rule-filter output for this stock.</div>
+            `}
+            ${isRuleFiltered ? `<details class="rule-details" data-stock="${escapeAttr(stock.stock_id)}" ${openDetails.has(stock.stock_id) ? 'open' : ''}>
               <summary class="muted">Rule details</summary>
               <div class="rule-grid">
                 ${rules.map(rule => `
@@ -734,54 +1077,53 @@ INDEX_HTML = r"""
                   </div>
                 `).join('')}
               </div>
-            </details>
+            </details>` : ''}
           </td>
           <td>
             <form class="upload" data-stock="${stock.stock_id}" data-name="${escapeAttr(stock.company_name)}">
-              <div class="field-row">
-                <input type="number" name="document_year" min="1900" max="2100" placeholder="Year">
-                <select name="document_quarter">
-                  <option value="">Quarter optional</option>
-                  <option value="Q1">Q1</option>
-                  <option value="Q2">Q2</option>
-                  <option value="Q3">Q3</option>
-                  <option value="Q4">Q4</option>
-                </select>
-              </div>
               <input type="file" name="file" multiple accept=".pdf,.txt,.md,.html,.htm,.csv,.json">
+              <div class="file-meta"></div>
               <button type="submit" class="secondary">Upload</button>
             </form>
             <div class="docs">${docs.length} document(s), ${docs.reduce((a,d)=>a+(d.chunk_count||0),0)} chunks</div>
             <form class="qa-box" data-stock="${stock.stock_id}">
               <textarea name="question" placeholder="Ask this stock's uploaded documents"></textarea>
-              <div class="field-row">
-                <input type="number" name="document_year" min="1900" max="2100" placeholder="Filter year">
-                <select name="document_quarter">
-                  <option value="">All quarters</option>
-                  <option value="Q1">Q1</option>
-                  <option value="Q2">Q2</option>
-                  <option value="Q3">Q3</option>
-                  <option value="Q4">Q4</option>
-                </select>
-              </div>
               <button type="submit" class="secondary">Ask Documents</button>
             </form>
-            <div class="qa-answer" id="qa-${escapeAttr(stock.stock_id)}" style="${qaAnswers[stock.stock_id] ? '' : 'display:none;'}">${renderQaAnswer(qaAnswers[stock.stock_id])}</div>
+            <div class="qa-answer" id="qa-${escapeAttr(stock.stock_id)}" style="${qaAnswers[stock.stock_id] ? '' : 'display:none;'}">${renderQaAnswer(qaAnswers[stock.stock_id], stock.stock_id, openTraces.has(stock.stock_id))}</div>
           </td>
           <td>
-            ${ai.total_score_out_of_100 !== undefined ? `<span class="badge">${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
-            <div class="muted">AI: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
-            <button class="secondary eval-one" data-stock="${stock.stock_id}">Evaluate</button>
+            ${isRuleFiltered ? `
+              ${isEvaluating ? `
+                <span class="badge">Evaluating</span>
+                <div class="inline-progress"><div class="inline-progress-fill"></div></div>
+                <div class="muted">${escapeHtml(latest.current_step || 'Running AI evaluation')}</div>
+              ` : `
+                ${ai.total_score_out_of_100 !== undefined ? `<span class="badge">${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
+                <div class="muted">AI: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
+                <button class="secondary eval-one" data-stock="${stock.stock_id}">Evaluate</button>
+              `}
+            ` : '<span class="muted">Document Q&A only</span>'}
           </td>
           <td>
-            <div>${escapeHtml(ai.verdict || '')}</div>
-            <div class="muted">${escapeHtml((ai.key_reasons || []).join(' | '))}</div>
+            ${ai.verdict ? `
+              <div class="verdict-box">
+                <div class="verdict-text">${escapeHtml(ai.verdict)}</div>
+                ${reasons.length ? `
+                  <ul class="reason-list">
+                    ${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join('')}
+                  </ul>
+                ` : ''}
+                ${sectionBreakdown}
+              </div>
+            ` : '<span class="muted">No verdict yet</span>'}
           </td>
         `;
         body.appendChild(tr);
       }
       document.querySelectorAll('form.upload').forEach(form => {
         form.addEventListener('submit', uploadForm);
+        form.querySelector('input[type=file]').addEventListener('change', () => renderFileMetadata(form));
       });
       document.querySelectorAll('form.qa-box').forEach(form => {
         form.addEventListener('submit', askForm);
@@ -791,20 +1133,97 @@ INDEX_HTML = r"""
       });
     }
 
+    function stockFormInteractionActive() {
+      const active = document.activeElement;
+      if (active && active.closest && active.closest('form.upload, form.qa-box')) return true;
+      if (document.querySelector('details.qa-trace[open]')) return true;
+      return Array.from(document.querySelectorAll('form.upload input[type=file]'))
+        .some(input => input.files && input.files.length);
+    }
+
     async function uploadForm(event) {
       event.preventDefault();
       const form = event.currentTarget;
       const input = form.querySelector('input[type=file]');
       if (!input.files.length) return;
+      renderFileMetadata(form);
+      const rows = Array.from(form.querySelectorAll('.file-meta-row'));
+      if (rows.length !== input.files.length) {
+        alert('Metadata rows did not match selected files. Please select the files again.');
+        return;
+      }
       const data = new FormData();
       data.append('stock_id', form.dataset.stock);
       data.append('company_name', form.dataset.name);
-      data.append('document_year', form.elements.document_year.value || '');
-      data.append('document_quarter', form.elements.document_quarter.value || '');
-      for (const file of input.files) data.append('file', file);
+      for (let index = 0; index < input.files.length; index += 1) {
+        const row = rows[index];
+        const documentType = row.querySelector('[data-field="document_type"]').value;
+        const documentYear = row.querySelector('[data-field="document_year"]').value;
+        const documentQuarter = row.querySelector('[data-field="document_quarter"]').value;
+        if (!documentType || !documentYear || !documentQuarter) {
+          alert('Please select document type, year, and quarter/period for every file.');
+          return;
+        }
+        data.append('file', input.files[index]);
+        data.append('document_type', documentType);
+        data.append('document_year', documentYear);
+        data.append('document_quarter', documentQuarter);
+      }
       await api('/api/upload', { method: 'POST', body: data });
       input.value = '';
+      form.querySelector('.file-meta').innerHTML = '';
       await refresh();
+    }
+
+    function renderFileMetadata(form) {
+      const input = form.querySelector('input[type=file]');
+      const container = form.querySelector('.file-meta');
+      const existing = Array.from(container.querySelectorAll('.file-meta-row')).map(row => ({
+        name: row.dataset.filename || '',
+        type: row.querySelector('[data-field="document_type"]')?.value || '',
+        year: row.querySelector('[data-field="document_year"]')?.value || '',
+        quarter: row.querySelector('[data-field="document_quarter"]')?.value || ''
+      }));
+      container.innerHTML = '';
+      Array.from(input.files).forEach((file, index) => {
+        const previous = existing[index] && existing[index].name === file.name ? existing[index] : {};
+        const row = document.createElement('div');
+        row.className = 'file-meta-row';
+        row.dataset.filename = file.name;
+        row.innerHTML = `
+          <div class="file-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</div>
+          <select data-field="document_type" required>
+            <option value="">Type</option>
+            <option value="report" ${previous.type === 'report' ? 'selected' : ''}>Report</option>
+            <option value="concall" ${previous.type === 'concall' ? 'selected' : ''}>Concall</option>
+          </select>
+          <select data-field="document_year" required>
+            <option value="">Year</option>
+            ${yearOptions(previous.year || '')}
+          </select>
+          <select data-field="document_quarter" required>
+            <option value="">Period</option>
+            ${periodOptions(previous.quarter || '')}
+          </select>
+        `;
+        container.appendChild(row);
+      });
+    }
+
+    function yearOptions(selected) {
+      const currentYear = new Date().getFullYear();
+      let options = '';
+      for (let year = currentYear + 1; year >= currentYear - 15; year -= 1) {
+        const value = `FY${year}`;
+        options += `<option value="${value}" ${value === String(selected) ? 'selected' : ''}>${value}</option>`;
+      }
+      return options;
+    }
+
+    function periodOptions(selected) {
+      return ['FY', 'Q1', 'Q2', 'Q3', 'Q4']
+        .map(period => `<option value="${period}" ${period === selected ? 'selected' : ''}>${period}</option>`)
+        .join('');
     }
 
     async function askForm(event) {
@@ -821,9 +1240,7 @@ INDEX_HTML = r"""
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             stock_id: stockId,
-            question,
-            document_year: form.elements.document_year.value || '',
-            document_quarter: form.elements.document_quarter.value || ''
+            question
           })
         });
         qaAnswers[stockId] = response.answer;
@@ -833,16 +1250,28 @@ INDEX_HTML = r"""
       renderStocks(latest.stocks || []);
     }
 
-    async function evaluate(stockId) {
+    function evaluate(stockId) {
+      evaluatingStockId = stockId || '__all__';
+      latest.running = true;
+      latest.phase = 'starting AI/RAG evaluation';
+      latest.current_step = stockId ? 'Starting AI evaluation' : 'Starting AI evaluation for all stocks';
+      renderStocks(latest.stocks || []);
       const payload = {
         stock_id: stockId || ''
       };
-      await api('/api/evaluate', {
+      api('/api/evaluate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
+      }).then(() => {
+        refresh();
+      }).catch(error => {
+        evaluatingStockId = '';
+        latest.running = false;
+        alert(`Could not start AI evaluation: ${error.message}`);
+        refresh();
       });
-      await refresh();
+      setTimeout(refresh, 300);
     }
 
     function escapeHtml(value) {
@@ -867,7 +1296,53 @@ INDEX_HTML = r"""
       };
       return names[name] || name;
     }
-    function renderQaAnswer(result) {
+    function sectionTitle(sectionId) {
+      const names = {
+        future_outlook: 'Future Outlook',
+        initiatives_progress: 'Initiatives Progress',
+        promise_delivery: 'Promise Delivery',
+        exaggeration_risk: 'Exaggeration Risk',
+        news_sentiment: 'News Sentiment',
+        industry_outlook: 'Industry Outlook'
+      };
+      return names[sectionId] || sectionId;
+    }
+    function renderSectionBreakdown(sections) {
+      const order = [
+        'future_outlook',
+        'initiatives_progress',
+        'promise_delivery',
+        'exaggeration_risk',
+        'news_sentiment',
+        'industry_outlook'
+      ];
+      const cards = order
+        .filter(sectionId => sections[sectionId])
+        .map(sectionId => {
+          const section = sections[sectionId] || {};
+          return `
+            <div class="section-card">
+              <div class="section-head">
+                <span class="section-title">${escapeHtml(sectionTitle(sectionId))}</span>
+                <span class="score-row">
+                  <span class="mini-score">Conf ${formatScore(section.confidence_score)}/100</span>
+                  <span class="mini-score">Risk ${formatScore(section.risk_score)}/100</span>
+                </span>
+              </div>
+              <div class="section-answer">${escapeHtml(section.answer || '')}</div>
+            </div>
+          `;
+        })
+        .join('');
+      return cards ? `<div class="section-breakdown">${cards}</div>` : '';
+    }
+    function formatScore(value) {
+      if (value === undefined || value === null || value === '') return '-';
+      const number = Number(value);
+      if (Number.isNaN(number)) return '-';
+      return Number.isInteger(number) ? String(number) : number.toFixed(1);
+    }
+    function renderQaAnswer(result, stockId, traceOpen) {
       if (!result) return '';
       if (result.loading) return escapeHtml(result.answer || '');
       const citations = (result.citations || []).map(citation => {
@@ -877,13 +1352,86 @@ INDEX_HTML = r"""
           ? `pp. ${pageStart}-${pageEnd}`
           : (pageStart ? `p. ${pageStart}` : 'page unknown');
         const meta = [citation.document_year, citation.document_quarter].filter(Boolean).join(' ');
-        return `${citation.source_id}: ${citation.document_name} (${page}${meta ? ', ' + meta : ''})`;
+        const type = citation.document_type ? citation.document_type.replaceAll('_', ' ') : '';
+        return `${citation.source_id}: ${citation.document_name} (${page}${meta ? ', ' + meta : ''}${type ? ', ' + type : ''})`;
       });
       const limitations = result.limitations || [];
       return `
-${escapeHtml(result.answer || '')}
-${citations.length ? '\n\nCitations:\n' + escapeHtml(citations.map(item => '- ' + item).join('\n')) : ''}
-${limitations.length ? '\n\nLimitations:\n' + escapeHtml(limitations.map(item => '- ' + item).join('\n')) : ''}
+<div>${escapeHtml(result.answer || '')}</div>
+${citations.length ? `<div><strong>Citations:</strong>\n${escapeHtml(citations.map(item => '- ' + item).join('\n'))}</div>` : ''}
+${limitations.length ? `<div><strong>Limitations:</strong>\n${escapeHtml(limitations.map(item => '- ' + item).join('\n'))}</div>` : ''}
+${renderQaTrace(result.trace, stockId, traceOpen)}
+`.trim();
+    }
+    function renderQaTrace(trace, stockId, traceOpen) {
+      if (!trace) return '';
+      const chunks = trace.retrieved_chunks || [];
+      const rawChunks = trace.raw_retrieved_chunks || [];
+      const rejectedChunks = trace.rejected_chunks || [];
+      const cited = trace.cited_source_ids || [];
+      const ignored = trace.ignored_source_ids || [];
+      return `
+<details class="qa-trace" data-stock="${escapeAttr(stockId)}" ${traceOpen ? 'open' : ''}>
+  <summary class="muted">Trace</summary>
+  <div class="trace-grid">
+    <div class="trace-card">
+      <strong>Status:</strong> ${escapeHtml(trace.status || '')}<br>
+      <strong>Trace file:</strong> ${escapeHtml(trace.trace_path || '')}<br>
+      <strong>Model:</strong> ${escapeHtml(trace.model || '')}<br>
+      <strong>Similarity threshold:</strong> ${escapeHtml(trace.similarity_threshold ?? '')}<br>
+      <strong>Raw retrieved chunks:</strong> ${escapeHtml(trace.raw_retrieved_chunk_count ?? rawChunks.length)}<br>
+      <strong>Accepted chunks:</strong> ${escapeHtml(trace.retrieved_chunk_count ?? chunks.length)}<br>
+      <strong>Rejected chunks:</strong> ${escapeHtml(trace.rejected_chunk_count ?? rejectedChunks.length)}<br>
+      <strong>Fallback used:</strong> ${escapeHtml(trace.used_filter_fallback ? 'yes' : 'no')}<br>
+      <strong>Cited source IDs:</strong> ${escapeHtml(cited.length ? cited.join(', ') : 'none')}<br>
+      <strong>Ignored source IDs:</strong> ${escapeHtml(ignored.length ? ignored.join(', ') : 'none')}
+    </div>
+    <div class="trace-card">
+      <strong>Inferred Filters</strong>
+      <pre class="trace-pre">${escapeHtml(JSON.stringify(trace.inferred_filters || {}, null, 2))}</pre>
+    </div>
+    <div class="trace-card">
+      <strong>Accepted Chunks Sent To Gemini</strong>
+      ${chunks.length ? chunks.map(renderTraceChunk).join('') : '<div class="muted">No chunks retrieved.</div>'}
+    </div>
+    <div class="trace-card">
+      <strong>Rejected Chunks Below Threshold</strong>
+      ${rejectedChunks.length ? rejectedChunks.map(renderTraceChunk).join('') : '<div class="muted">No chunks rejected.</div>'}
+    </div>
+    <div class="trace-card">
+      <strong>Prompt Sent To Gemini</strong>
+      <pre class="trace-pre">${escapeHtml(trace.prompt || '')}</pre>
+    </div>
+    <div class="trace-card">
+      <strong>Parsed Model Response</strong>
+      <pre class="trace-pre">${escapeHtml(JSON.stringify(trace.parsed_response || {}, null, 2))}</pre>
+    </div>
+    <div class="trace-card">
+      <strong>Raw Model Text</strong>
+      <pre class="trace-pre">${escapeHtml(trace.raw_model_text || '')}</pre>
+    </div>
+    <div class="trace-card">
+      <strong>Raw API Payload</strong>
+      <pre class="trace-pre">${escapeHtml(JSON.stringify(trace.raw_payload || {}, null, 2))}</pre>
+    </div>
+  </div>
+</details>
+`.trim();
+    }
+    function renderTraceChunk(chunk) {
+      const pageStart = chunk.page_start;
+      const pageEnd = chunk.page_end || pageStart;
+      const page = pageStart && pageEnd && pageStart !== pageEnd
+        ? `pp. ${pageStart}-${pageEnd}`
+        : (pageStart ? `p. ${pageStart}` : 'page unknown');
+      const meta = [chunk.document_year, chunk.document_quarter, chunk.document_type].filter(Boolean).join(', ');
+      return `
+<div class="trace-card">
+  <strong>${escapeHtml(chunk.source_id || '')}</strong>
+  ${escapeHtml(chunk.document_name || '')}
+  <div class="muted">${escapeHtml(page)}${meta ? ' | ' + escapeHtml(meta) : ''} | chunk ${escapeHtml(chunk.chunk_index || '')} | score ${escapeHtml(chunk.similarity_score ?? '')}</div>
+  <pre class="trace-pre">${escapeHtml(chunk.text_excerpt || '')}</pre>
+</div>
 `.trim();
     }
     function ruleDetailsFromStock(stock) {

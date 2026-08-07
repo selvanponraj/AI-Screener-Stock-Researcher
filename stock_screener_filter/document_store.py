@@ -25,6 +25,7 @@ DOCUMENTS_PATH = STORE_DIR / "documents.json"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
 DEFAULT_CHUNK_SIZE = 2500
 DEFAULT_CHUNK_OVERLAP = 350
+VALID_DOCUMENT_TYPES = {"report", "concall"}
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class StoredDocument:
     text_chars: int
     chunk_count: int
     duplicate: bool
+    document_type: str = "report"
     document_year: str = ""
     document_quarter: str = ""
     note: str = ""
@@ -80,10 +82,14 @@ def save_upload(
     company_name: str,
     filename: str,
     source: BinaryIO,
+    document_type: str = "report",
     document_year: str = "",
     document_quarter: str = "",
 ) -> StoredDocument:
     ensure_dirs()
+    document_type = document_type.strip().lower()
+    if document_type not in VALID_DOCUMENT_TYPES:
+        raise RuntimeError("Document type must be either report or concall.")
     stock_raw_dir = RAW_DIR / stock_id
     stock_raw_dir.mkdir(parents=True, exist_ok=True)
     temp_path = stock_raw_dir / f".upload_{safe_name(filename)}"
@@ -105,6 +111,7 @@ def save_upload(
             text_chars=int(existing.get("text_chars", 0)),
             chunk_count=int(existing.get("chunk_count", 0)),
             duplicate=True,
+            document_type=str(existing.get("document_type", "report")),
             document_year=str(existing.get("document_year", "")),
             document_quarter=str(existing.get("document_quarter", "")),
             note="Already uploaded for this stock.",
@@ -114,7 +121,7 @@ def save_upload(
     temp_path.replace(stored_path)
     pages, note = extract_pages(stored_path)
     chunks = chunk_pages(pages)
-    write_chunks(stock_id, digest, filename, chunks, document_year, document_quarter)
+    write_chunks(stock_id, digest, filename, chunks, document_type, document_year, document_quarter)
     text_chars = sum(len(page["text"]) for page in pages)
     load_env()
     stock_docs[digest] = {
@@ -124,6 +131,7 @@ def save_upload(
         "stored_path": str(stored_path.relative_to(PROJECT_ROOT)),
         "text_chars": text_chars,
         "chunk_count": len(chunks),
+        "document_type": document_type,
         "document_year": document_year,
         "document_quarter": document_quarter,
         "embedding_model": DEFAULT_EMBEDDING_MODEL,
@@ -143,6 +151,7 @@ def save_upload(
         text_chars=text_chars,
         chunk_count=len(chunks),
         duplicate=False,
+        document_type=document_type,
         document_year=document_year,
         document_quarter=document_quarter,
         note=note,
@@ -332,6 +341,7 @@ def write_chunks(
     document_sha: str,
     filename: str,
     chunks: list[dict[str, object]],
+    document_type: str = "report",
     document_year: str = "",
     document_quarter: str = "",
 ) -> None:
@@ -348,6 +358,7 @@ def write_chunks(
             "page_start": int(chunk.get("page_start", 0) or 0),
             "page_end": int(chunk.get("page_end", 0) or 0),
             "pages": str(chunk.get("pages", "")),
+            "document_type": document_type,
             "document_year": document_year,
             "document_quarter": document_quarter,
             "embedding_model": DEFAULT_EMBEDDING_MODEL,
@@ -388,15 +399,33 @@ def search_chunks(
     limit: int = 10,
     document_year: str = "",
     document_quarter: str = "",
+    document_type: str = "",
+    document_years: list[str] | None = None,
+    document_quarters: list[str] | None = None,
+    document_types: list[str] | None = None,
 ) -> list[dict[str, object]]:
     collection = stock_collection(stock_id)
     if collection.count() == 0:
         return []
     filters = []
-    if document_year:
-        filters.append({"document_year": document_year})
-    if document_quarter:
-        filters.append({"document_quarter": document_quarter})
+    years = document_years or ([document_year] if document_year else [])
+    quarters = document_quarters or ([document_quarter] if document_quarter else [])
+    types = document_types or ([document_type] if document_type else [])
+    years = [str(year).strip() for year in years if str(year).strip()]
+    quarters = [str(quarter).strip().upper() for quarter in quarters if str(quarter).strip()]
+    types = sorted({str(item).strip().lower() for item in types if str(item).strip().lower() in VALID_DOCUMENT_TYPES})
+    if len(years) == 1:
+        filters.append({"document_year": years[0]})
+    elif len(years) > 1:
+        filters.append({"document_year": {"$in": years}})
+    if len(quarters) == 1:
+        filters.append({"document_quarter": quarters[0]})
+    elif len(quarters) > 1:
+        filters.append({"document_quarter": {"$in": quarters}})
+    if len(types) == 1:
+        filters.append({"document_type": types[0]})
+    elif len(types) > 1:
+        filters.append({"document_type": {"$in": sorted(set(types))}})
     where = None
     if len(filters) == 1:
         where = filters[0]
@@ -431,6 +460,26 @@ def search_chunks(
 def stock_documents(stock_id: str) -> list[dict[str, object]]:
     index = load_document_index()
     return list(index.get(stock_id, {}).values())
+
+
+def stocks_with_documents() -> list[dict[str, object]]:
+    stocks: list[dict[str, object]] = []
+    for stock_id, documents_by_hash in load_document_index().items():
+        documents = list(documents_by_hash.values())
+        if not documents:
+            continue
+        first_document = documents[0]
+        company_name = str(first_document.get("company_name") or stock_id)
+        stocks.append(
+            {
+                "stock_id": stock_id,
+                "company_name": company_name,
+                "company_url": "",
+                "market_categories": "Document library",
+                "stock_source": "document_store",
+            }
+        )
+    return sorted(stocks, key=lambda stock: str(stock["company_name"]).lower())
 
 
 def stock_document_fingerprint(stock_id: str) -> dict[str, object]:
