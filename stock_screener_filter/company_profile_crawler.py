@@ -19,6 +19,7 @@ from playwright.sync_api import Error, Page, TimeoutError, sync_playwright
 from stock_screener_filter.screener_login import (
     DEFAULT_BROWSER_CHANNEL,
     DEFAULT_PROFILE_DIR,
+    looks_logged_in,
     verify_logged_in_session,
 )
 
@@ -204,8 +205,11 @@ def download_profile(
 ) -> dict[str, Any]:
     response = page.goto(company_url, wait_until="domcontentloaded")
 
-    if "/login/" in urlparse(page.url).path.lower():
-        raise RuntimeError("Screener redirected to login. Run the login helper first.")
+    if "/login/" in urlparse(page.url).path.lower() or not looks_logged_in(page):
+        raise RequestRejectedError(
+            "Screener session is logged out. Run the Login / verify Screener session step, "
+            "then resume the company profile crawler."
+        )
 
     if response and response.status in {403, 429}:
         raise RequestRejectedError(f"Screener returned HTTP {response.status}.")

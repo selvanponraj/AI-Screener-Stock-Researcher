@@ -52,6 +52,44 @@ rule output for banks, NBFCs, insurance companies, financial-services firms, or
 similar financial businesses. Their balance-sheet, debt, cash-flow, and return
 metrics are not comparable to normal operating companies.
 
+## Quantitative Rules
+
+The pipeline evaluates these 13 rules for each non-financial company:
+
+1. **P/E versus industry:** Stock P/E must be less than or equal to `1.25 x`
+   Industry PE.
+2. **P/E versus historical valuation:** Stock P/E must be less than or equal to
+   `1.1 x` the historical P/E for at least two of the available 3-year, 5-year,
+   and 7-year periods. At least two historical values must be available.
+3. **ROCE:** ROCE must be greater than `10%`.
+4. **ROE:** ROE must be greater than `10%`.
+5. **Debt to equity:** Debt to equity must be less than `0.5`.
+6. **DPR YOY:** DPR YOY must be greater than `0%`.
+7. **Promoter pledging:** Pledged percentage must equal `0%`.
+8. **Sales-growth consistency:** The crawler uses up to the latest 11 annual
+   sales observations, which produces up to 10 year-over-year comparisons. At
+   least `70%` of the available comparisons must show sales growth of `10%` or
+   more. If fewer years are available, the same 70% test is applied to all
+   available annual comparisons.
+9. **Compounded profit growth:** At least two available periods among 3 years,
+   5 years, 10 years, and TTM must have profit growth greater than `10%`.
+10. **Price CAGR versus profit growth:** Stock Price CAGR must be lower than the
+    corresponding compounded profit growth for at least two periods among
+    3 years, 5 years, 10 years, and TTM. Screener's 1-year stock return is used
+    for the TTM comparison.
+11. **Promoter holding stability:** The decrease between the first and latest
+    available annual promoter-holding observations must be less than
+    `5 percentage points`.
+12. **SSGR:** SSGR must be greater than `0` for every evaluated year and at
+    least `10` for at least half of those years.
+13. **CFO as a percentage of EBITDA:** The average CFO/EBITDA percentage over
+    the latest five available years must be greater than `50%`.
+
+An unavailable input is recorded as `missing`; it is not counted as a passed
+rule. The final quantitative filter requires at least `10 of 13` rules, which
+is the configured `>=75%` pass threshold. Excel rules 12 and 13 are downloaded
+and evaluated only for companies that pass at least 6 of the first 11 rules.
+
 ## Prerequisites
 
 Install these before running the project:
@@ -144,6 +182,23 @@ In the browser window that opens:
 The app also verifies login before crawling. If Screener is logged out, it opens
 the login window and waits for you to finish login.
 
+### Required Screener Excel Template
+
+The repository includes the custom Excel export template used by this project:
+
+```text
+excel_template_screener/TCS.xlsx
+```
+
+Upload this file as your Excel template in the Screener.in website before
+running the pipeline. Although the file is named `TCS.xlsx`, it is the reusable
+template Screener applies when exporting any company from your account.
+
+This setup is required for Excel rules 12 and 13. The Excel analyzer expects the
+worksheets, rows, formulas, SSGR values, and CFO/EBITDA values provided by this
+template. Screener's default Excel export or a differently structured template
+may cause those rules to be reported as `missing` or parsed incorrectly.
+
 ## Fresh Setup
 
 Clone the repository:
@@ -226,20 +281,27 @@ Do not commit `.env`. It is intentionally ignored by Git.
 
 ## Browser Choice
 
-The default browser channel is currently:
+The full pipeline reads the browser channel and persistent profile directory
+from `.env`. To use Microsoft Edge, set:
 
-```text
-msedge
+```env
+SCREENER_BROWSER_CHANNEL=msedge
+SCREENER_PROFILE_DIR=.browser/screener-profile-edge
 ```
 
-That means Playwright uses installed Microsoft Edge and stores the Screener
-session under:
+To use Google Chrome instead, set:
 
-```text
-.browser/screener-profile-edge
+```env
+SCREENER_BROWSER_CHANNEL=chrome
+SCREENER_PROFILE_DIR=.browser/screener-profile-chrome
 ```
 
-If you want to use Chrome manually:
+Keep the channel and profile directory paired as shown. Each profile has its
+own Screener cookies and login session, so switching browsers may require one
+fresh login. The same pair is used by the login helper, screen crawler, company
+profile crawler, and Excel crawler.
+
+To open the configured Chrome profile explicitly for setup or troubleshooting:
 
 ```bash
 python -m stock_screener_filter.screener_login --browser-channel chrome --manual --keep-open
@@ -316,11 +378,12 @@ http://127.0.0.1:8765
 
 Click **Run Screener Pipeline**.
 
-Expect the Screener scraping stage to take time. A full run can take around 30
-minutes or more depending on the number of companies, internet speed, and
-Screener response time. This is intentional: the crawler makes requests one at a
-time and keeps delays between requests so it does not hit Screener too
-aggressively or trigger temporary throttling.
+Expect the Screener crawling stage to take a long time. A full three-screen run
+can take almost 2 hours depending on the number of companies, retries, internet
+speed, and Screener response time. This is intentional: the crawler processes
+requests one at a time and keeps several seconds between requests to respect
+Screener's rate limits and reduce the risk of temporary throttling or blocking.
+Do not close the app or stop its terminal while the pipeline is running.
 
 The app will:
 
@@ -670,9 +733,10 @@ Increase delays:
 
 Avoid rerunning large crawls repeatedly in a short period.
 
-The scraper is deliberately conservative. Large runs can take around 30 minutes
-or more because the app spaces out requests to reduce the chance of Screener
-temporarily blocking or throttling your connection.
+The scraper is deliberately conservative. A complete run can take almost 2
+hours because the app spaces out requests to respect Screener's rate limits and
+reduce the chance of Screener temporarily blocking or throttling your
+connection.
 
 ### First document upload is slow
 

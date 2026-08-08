@@ -37,11 +37,7 @@ LOGGED_IN_SELECTORS = (
     "a[href*='/logout']",
     "button:has-text('Logout')",
     "text=Logout",
-    "a[href*='/user/']",
-    "a[href*='/user/account/']",
-    "a[href*='/watchlist']",
-    "a[href*='/alerts/']",
-    "a[href*='/notebook/']",
+    "a[href='/user/account/']",
 )
 
 
@@ -138,10 +134,6 @@ def verify_logged_in_session(page: Page, url: str = DEFAULT_URL) -> bool:
 
     page.goto(ACCOUNT_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(1_000)
-    current = urlparse(page.url)
-    if current.netloc.lower().endswith("screener.in") and "/login/" not in current.path.lower():
-        return True
-
     return looks_logged_in(page)
 
 
