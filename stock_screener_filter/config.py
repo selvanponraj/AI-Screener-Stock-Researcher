@@ -19,6 +19,7 @@ def load_env() -> None:
         load_dotenv(ENV_PATH)
         return
 
+    # Minimal fallback for environments where python-dotenv was not installed yet.
     if not ENV_PATH.is_file():
         return
     for line in ENV_PATH.read_text(encoding="utf-8").splitlines():

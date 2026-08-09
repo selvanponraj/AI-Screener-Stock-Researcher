@@ -23,6 +23,8 @@ PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
 
 def load_visible_stocks() -> list[dict[str, Any]]:
+    # Keep previously uploaded document-library stocks visible even when they are
+    # absent from the latest quantitative filter output.
     stocks_by_id: dict[str, dict[str, Any]] = {}
     for stock in rules_pipeline.load_current_rule_filtered():
         stock_id = str(stock["stock_id"])
@@ -44,6 +46,7 @@ def load_visible_stocks() -> list[dict[str, Any]]:
 
 class AppState:
     def __init__(self) -> None:
+        # HTTP handlers, background jobs, and status polling share this in-memory state.
         self.lock = threading.Lock()
         self.running = False
         self.phase = "idle"
@@ -58,6 +61,7 @@ class AppState:
     def log(self, message: str) -> None:
         with self.lock:
             self.logs.append(message)
+            # Bound long crawler runs so status responses and memory use stay predictable.
             self.logs = self.logs[-500:]
 
     def snapshot(self) -> dict[str, Any]:
@@ -1030,6 +1034,7 @@ INDEX_HTML = r"""
 
     function renderStocks(stocks) {
       const body = $('stocks');
+      // Polling rebuilds the table, so capture disclosure state before replacing its rows.
       const openDetails = new Set(
         Array.from(document.querySelectorAll('details.rule-details[open]'))
           .map(detail => detail.dataset.stock)
@@ -1134,6 +1139,7 @@ INDEX_HTML = r"""
     }
 
     function stockFormInteractionActive() {
+      // Do not let background polling erase typed questions, selected files, or open traces.
       const active = document.activeElement;
       if (active && active.closest && active.closest('form.upload, form.qa-box')) return true;
       if (document.querySelector('details.qa-trace[open]')) return true;

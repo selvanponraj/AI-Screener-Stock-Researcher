@@ -149,6 +149,8 @@ def ssgr_values(data_sheet: Any) -> list[Optional[float]]:
 
 
 def analyze_workbook(path: Path) -> dict[str, Any]:
+    # openpyxl does not calculate formulas. Read the source Data Sheet and recreate
+    # the template formulas so results do not depend on cached Excel values.
     workbook = load_workbook(path, data_only=False, read_only=True)
     try:
         data_sheet = workbook["Data Sheet"]

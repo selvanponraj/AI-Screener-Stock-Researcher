@@ -96,6 +96,7 @@ def save_upload(
     with temp_path.open("wb") as target:
         shutil.copyfileobj(source, target)
 
+    # Deduplicate by file contents, not by the user-supplied filename.
     digest = sha256_file(temp_path)
     index = load_document_index()
     stock_docs = index.setdefault(stock_id, {})
@@ -225,6 +226,8 @@ def split_text_with_offsets(text: str) -> list[dict[str, object]]:
 
 
 def chunk_pages(pages: list[dict[str, object]]) -> list[dict[str, object]]:
+    # Build one coordinate space for the whole document so chunk overlap can cross
+    # page boundaries; page_spans maps each resulting chunk back to citations.
     parts: list[str] = []
     page_spans: list[dict[str, int]] = []
     cursor = 0
@@ -249,6 +252,7 @@ def chunk_pages(pages: list[dict[str, object]]) -> list[dict[str, object]]:
     for chunk in split_text_with_offsets(full_text):
         start = int(chunk["start"])
         end = int(chunk["end"])
+        # Half-open interval overlap: page_start < chunk_end and page_end > chunk_start.
         pages_for_chunk = [
             span["page"]
             for span in page_spans
@@ -282,6 +286,7 @@ def chroma_client() -> object:
 
 
 def collection_name(stock_id: str) -> str:
+    # A stable digest gives Chroma-safe collection names while stock_id remains in metadata.
     stock_digest = hashlib.sha256(stock_id.encode("utf-8")).hexdigest()[:16]
     return f"stock-bge-m3-{stock_digest}"
 
@@ -305,6 +310,7 @@ def embedding_model() -> object:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     configured_local_only = os.environ.get("EMBEDDING_LOCAL_FILES_ONLY")
     if configured_local_only is None:
+        # Permit the first download, then default to the existing local cache on later runs.
         model_cache_name = f"models--{DEFAULT_EMBEDDING_MODEL.replace('/', '--')}"
         local_files_only = (MODEL_CACHE_DIR / model_cache_name).exists()
     else:
@@ -348,6 +354,7 @@ def write_chunks(
     if not chunks:
         return
     collection = stock_collection(stock_id)
+    # Deterministic IDs make the upsert idempotent; all parallel lists retain chunk order.
     ids = [f"{document_sha}:{index}" for index in range(1, len(chunks) + 1)]
     metadatas = [
         {
@@ -451,6 +458,7 @@ def search_chunks(
             {
                 "text": text,
                 **(metadata or {}),
+                # Chroma returns cosine distance; callers consume a higher-is-better score.
                 "score": max(0.0, 1.0 - float(distance)),
             }
         )
@@ -483,6 +491,7 @@ def stocks_with_documents() -> list[dict[str, object]]:
 
 
 def stock_document_fingerprint(stock_id: str) -> dict[str, object]:
+    # Evaluation caches depend on the document set, not upload order or filenames.
     documents = stock_documents(stock_id)
     hashes = sorted(str(document.get("sha256", "")) for document in documents if document.get("sha256"))
     digest = hashlib.sha256("\n".join(hashes).encode("utf-8")).hexdigest()

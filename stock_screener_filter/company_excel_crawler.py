@@ -89,6 +89,8 @@ def selected_companies(analysis_csv: Path, minimum_passes: int) -> list[dict[str
     with analysis_csv.open(newline="", encoding="utf-8") as csv_file:
         rows = list(csv.DictReader(csv_file))
 
+    # Excel analysis is intentionally limited to companies that meet the configured
+    # first-stage pass threshold, reducing authenticated exports and rate-limit risk.
     selected: list[dict[str, str]] = []
     for row in rows:
         pass_count = sum(row.get(rule) == "pass" for rule in RULE_COLUMNS)

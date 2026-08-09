@@ -99,6 +99,7 @@ def page_number(url: str) -> int:
 
 
 def pagination_links(page: Page) -> list[dict[str, str]]:
+    # Read all navigation hints in one browser call; anchor.href also resolves relative URLs.
     return page.locator(".pagination a").evaluate_all(
         """anchors => anchors.map(anchor => ({
             href: anchor.href,
@@ -117,6 +118,8 @@ def next_page_url(page: Page, current_url: str) -> str | None:
         if link["rel"].lower() == "next" or label in {"next", "next page", "next >", "next >>"}:
             return link["href"]
 
+    # Some Screener pages omit a reliable "next" marker, so fall back to the
+    # nearest numbered page after the current one.
     current_number = page_number(current_url)
     later_pages = [
         link

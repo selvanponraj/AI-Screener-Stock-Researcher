@@ -269,6 +269,7 @@ def safe_name(value: str) -> str:
 
 def search_cache_path(stock_id: str, question_id: str) -> Path:
     SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # News and industry results are reusable within a day but refresh automatically tomorrow.
     today = date.today().strftime("%Y%m%d")
     return SEARCH_CACHE_DIR / f"{safe_name(stock_id)}_{safe_name(question_id)}_{today}.json"
 
@@ -373,6 +374,7 @@ def search_citations(results: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 def retrieve_chunks(stock_id: str, queries: list[str] | tuple[str, ...], limit_per_query: int = 5) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
+    # Different semantic queries often retrieve the same physical chunk.
     seen: set[tuple[str, int]] = set()
     for query in queries:
         for chunk in document_store.search_chunks(stock_id, query, limit=limit_per_query):
@@ -763,6 +765,7 @@ Rules:
     except Exception:
         pass
 
+    # Metadata inference must not make document Q&A unavailable when Gemini fails.
     fallback = regex_document_filters(question)
     return {
         "apply_metadata_filter": bool(
@@ -813,6 +816,8 @@ def analyze_question(state: EvaluationState, spec: QuestionSpec) -> EvaluationSt
         raise RuntimeError(f"AI section failed at {spec.question_id}: {exc}") from exc
     section = validate_section(parsed, spec)
 
+    # LangGraph state is shared between nodes, so copy nested mappings before
+    # adding this node's output instead of mutating prior state in place.
     analyses = dict(state.get("section_analyses", {}))
     citations_by_section = dict(state.get("section_citations", {}))
     raw_text_by_section = dict(state.get("section_raw_model_text", {}))
@@ -948,6 +953,7 @@ def current_evaluation(stock_id: str) -> dict[str, Any] | None:
     evaluation = load_evaluation(stock_id)
     if not evaluation:
         return None
+    # Reuse the expensive evaluation until the stock's uploaded document set changes.
     document_state = document_store.stock_document_fingerprint(stock_id)
     if evaluation.get("document_fingerprint") != document_state["document_fingerprint"]:
         return None
@@ -1038,6 +1044,8 @@ def answer_document_question(
         document_types=inferred_filters.get("document_types", []),
     )
     used_filter_fallback = False
+    # Explicit metadata is preferred, but widening the search is more useful than
+    # a false empty result when uploaded metadata and query wording disagree.
     if not chunks and inferred_filters.get("apply_metadata_filter"):
         used_filter_fallback = True
         chunks = document_store.search_chunks(stock_id, question, limit=8)
@@ -1049,6 +1057,8 @@ def answer_document_question(
     raw_traced_chunks = qa_trace_chunks(raw_source_map)
     rejected_traced_chunks = qa_trace_chunks(rejected_source_map)
 
+    # Stop before Gemini when retrieval found nothing above the relevance gate.
+    # This saves a model call and prevents answers built from unrelated context.
     if not chunks:
         answer = (
             "No matching uploaded document chunks were found for this question."

@@ -67,6 +67,8 @@ def current_paths() -> PipelinePaths:
 
 
 def clean_current_run() -> PipelinePaths:
+    # Uploaded documents, embeddings, and AI results live outside current_run and
+    # intentionally survive a fresh quantitative pipeline run.
     if CURRENT_RUN_DIR.exists():
         shutil.rmtree(CURRENT_RUN_DIR)
     paths = current_paths()
@@ -83,6 +85,8 @@ def remove_path(path: Path) -> None:
 
 
 def clean_for_step(step_id: str, paths: PipelinePaths) -> None:
+    # Invalidate only downstream products. Profile and Excel download steps use
+    # their manifests to retain successful files when a partial batch is resumed.
     if step_id == "screens":
         remove_path(paths.screens_dir)
         remove_path(paths.companies_dir)
@@ -107,6 +111,7 @@ def run_command(args: list[str], log: Callable[[str], None]) -> None:
         args,
         cwd=PROJECT_ROOT,
         stdout=subprocess.PIPE,
+        # Preserve subprocess output order for the live UI log.
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
@@ -404,6 +409,7 @@ def combine_rule_outputs(paths: PipelinePaths) -> list[dict[str, object]]:
         first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
         excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
         total_passes = first_passes + excel_passes
+        # Quantitative rules contribute exactly half of the final 100-point score.
         rule_score = round((total_passes / TOTAL_RULES) * 50, 2)
         combined.append(
             {
@@ -492,6 +498,8 @@ def pipeline_status() -> list[dict[str, object]]:
     ][:3]
     excel_rows = csv_row_count(paths.excel_analysis_dir / "excel_rule_results.csv")
 
+    # A saved browser directory is only a UI progress hint. Each crawler still
+    # verifies the live authenticated session before making protected requests.
     return [
         {
             "id": "login",
@@ -543,6 +551,7 @@ def stock_id(company_name: str, company_url: str) -> str:
     import re
 
     base = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-") or "stock"
+    # The URL digest disambiguates companies whose normalized names collide.
     digest = hashlib.sha256(company_url.encode("utf-8")).hexdigest()[:8]
     return f"{base}-{digest}"
 

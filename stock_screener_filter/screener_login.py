@@ -37,6 +37,7 @@ LOGGED_IN_SELECTORS = (
     "a[href*='/logout']",
     "button:has-text('Logout')",
     "text=Logout",
+    # Keep this exact: a substring selector also matches logged-out redirect links.
     "a[href='/user/account/']",
 )
 
@@ -132,6 +133,8 @@ def verify_logged_in_session(page: Page, url: str = DEFAULT_URL) -> bool:
     if looks_logged_in(page):
         return True
 
+    # The account route is a second independent check when the home-page header
+    # has not finished rendering its authenticated controls.
     page.goto(ACCOUNT_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(1_000)
     return looks_logged_in(page)

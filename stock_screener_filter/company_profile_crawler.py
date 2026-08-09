@@ -163,6 +163,8 @@ def company_filename(company_url: str) -> str:
 
 
 def visible_ratio_labels(page: Page) -> set[str]:
+    # Screener has used several containers for quick ratios; the broad fallback
+    # keeps the validation tolerant of layout changes while matching exact labels.
     selectors = (
         "li[data-source='quick-ratio'] span.name",
         "#top-ratios span.name",
@@ -216,6 +218,8 @@ def download_profile(
     if response and response.status >= 400:
         raise RuntimeError(f"Screener returned HTTP {response.status}.")
 
+    # These custom ratios are tied to the authenticated Screener profile. Saving
+    # without them would silently turn several downstream rules into "missing".
     quick_ratios_ready, visible_labels, missing_labels = wait_for_quick_ratios(page, quick_ratio_wait_seconds)
     if not page.locator("section#profit-loss").count():
         raise RequestRejectedError("Screener returned an interstitial instead of a company profile.")
@@ -395,6 +399,8 @@ def main() -> int:
                     "fetched_at": datetime.now(timezone.utc).isoformat(),
                 }
                 print(f"Failed {company_url}: {exc}", file=sys.stderr, flush=True)
+                # Authentication failures and rate-limit/interstitial responses
+                # should stop the batch instead of producing hundreds of bad files.
                 stop_crawling = isinstance(exc, RequestRejectedError)
 
             record["source_screen_files"] = company_sources[company_url]

@@ -120,6 +120,8 @@ def sales_history(soup: BeautifulSoup) -> list[tuple[str, float]]:
 
 def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
     history = sales_history(soup)
+    # Eleven annual values yield at most ten YoY comparisons; newer companies are
+    # judged against 70% of however many valid comparisons are available.
     recent_history = history[-11:]
     growth_rates: list[float] = []
     for (_, previous), (_, current) in zip(recent_history, recent_history[1:]):
@@ -191,6 +193,8 @@ def company_name(soup: BeautifulSoup, html_path: Path) -> str:
 
 
 def market_classification(soup: BeautifulSoup) -> dict[str, Any]:
+    # Screener's market hierarchy is deterministic and avoids an AI call for the
+    # financial-company exclusion policy.
     categories: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for anchor in soup.select('a[href^="/market/"][title]'):
