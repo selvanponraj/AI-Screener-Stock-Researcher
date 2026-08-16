@@ -155,39 +155,64 @@ def analyze_workbook(path: Path) -> dict[str, Any]:
     try:
         data_sheet = workbook["Data Sheet"]
         ssgr = ssgr_values(data_sheet)
-        ssgr_complete = all(value is not None for value in ssgr)
-        ssgr_positive = ssgr_complete and all(value > 0 for value in ssgr if value is not None)
-        ssgr_over_10_count = sum(value >= 10 for value in ssgr if value is not None)
-        ssgr_minimum = math.ceil(len(ssgr) / 2)
-        ssgr_rule = (
-            "missing"
-            if not ssgr_complete
-            else "pass"
-            if ssgr_positive and ssgr_over_10_count >= ssgr_minimum
-            else "fail"
+        ssgr_3y_latest = [v for v in ssgr[-3:] if v is not None]
+        ssgr_3y_avg = average(ssgr_3y_latest) if len(ssgr_3y_latest) == 3 else None
+
+        sales = data_row(data_sheet, 17)
+        sales_cagr_3y: float | None = None
+        if len(sales) >= 4 and sales[-4] is not None and sales[-1] is not None and sales[-4] > 0 and sales[-1] > 0:
+            sales_cagr_3y = ((sales[-1] / sales[-4]) ** (1 / 3) - 1) * 100
+
+        ssgr_pass = (
+            ssgr_3y_avg > 10.0 and sales_cagr_3y is not None and ssgr_3y_avg >= sales_cagr_3y
+            if ssgr_3y_avg is not None and sales_cagr_3y is not None
+            else False
         )
+        ssgr_rule = "missing" if ssgr_3y_avg is None or sales_cagr_3y is None else ("pass" if ssgr_pass else "fail")
 
         cfo = data_row(data_sheet, 82)
+        net_profit = data_row(data_sheet, 30)
         operating_profit_values = operating_profit(data_sheet)
         ebitda = operating_profit_values[1:] + [trailing_operating_profit(data_sheet)]
-        cfo_ebitda_values = [
-            safe_ratio(cfo_value, ebitda_value) * 100
-            if safe_ratio(cfo_value, ebitda_value) is not None
-            else None
-            for cfo_value, ebitda_value in zip(cfo, ebitda)
-        ]
-        latest_five = cfo_ebitda_values[-5:]
-        cfo_ebitda_average = average(latest_five)
-        cfo_rule = "missing" if cfo_ebitda_average is None else "pass" if cfo_ebitda_average > 50 else "fail"
+
+        cfo_5y = [v for v in cfo[-5:] if v is not None]
+        ebitda_5y = [v for v in ebitda[-5:] if v is not None]
+        pat_5y = [v for v in net_profit[-5:] if v is not None]
+
+        cum_cfo_5y = sum(cfo_5y) if len(cfo_5y) == 5 else None
+        cum_ebitda_5y = sum(ebitda_5y) if len(ebitda_5y) == 5 else None
+        cum_pat_5y = sum(pat_5y) if len(pat_5y) == 5 else None
+
+        cfo_ebitda_cum_ratio: float | None = None
+        if cum_cfo_5y is not None and cum_ebitda_5y is not None and cum_ebitda_5y > 0:
+            cfo_ebitda_cum_ratio = (cum_cfo_5y / cum_ebitda_5y) * 100
+
+        cfo_pat_cum_ratio: float | None = None
+        if cum_cfo_5y is not None and cum_pat_5y is not None and cum_pat_5y > 0:
+            cfo_pat_cum_ratio = (cum_cfo_5y / cum_pat_5y) * 100
+
+        cfo_pass = (
+            cfo_ebitda_cum_ratio >= 65.0 and cfo_pat_cum_ratio >= 80.0
+            if cfo_ebitda_cum_ratio is not None and cfo_pat_cum_ratio is not None
+            else False
+        )
+
+        cfo_rule = (
+            "missing"
+            if cfo_ebitda_cum_ratio is None or cfo_pat_cum_ratio is None
+            else ("pass" if cfo_pass else "fail")
+        )
 
         return {
             "ssgr_values_e27_k27": ssgr,
-            "ssgr_all_years_positive": ssgr_positive if ssgr_complete else None,
-            "ssgr_years_at_or_above_10": ssgr_over_10_count,
-            "ssgr_minimum_years_at_or_above_10": ssgr_minimum,
+            "ssgr_3y_avg": ssgr_3y_avg,
+            "excel_sales_cagr_3y": sales_cagr_3y,
             "rule_12_ssgr": ssgr_rule,
-            "cfo_ebitda_last_five_values": latest_five,
-            "cfo_ebitda_last_five_average": cfo_ebitda_average,
+            "cum_cfo_5y": cum_cfo_5y,
+            "cum_ebitda_5y": cum_ebitda_5y,
+            "cum_pat_5y": cum_pat_5y,
+            "cfo_ebitda_cum_ratio": cfo_ebitda_cum_ratio,
+            "cfo_pat_cum_ratio": cfo_pat_cum_ratio,
             "rule_13_cfo_ebitda": cfo_rule,
         }
     finally:

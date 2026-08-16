@@ -120,13 +120,15 @@ def sales_history(soup: BeautifulSoup) -> list[tuple[str, float]]:
 
 def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
     history = sales_history(soup)
-    # Eleven annual values yield at most ten YoY comparisons; newer companies are
-    # judged against 70% of however many valid comparisons are available.
     recent_history = history[-11:]
     growth_rates: list[float] = []
     for (_, previous), (_, current) in zip(recent_history, recent_history[1:]):
         if previous > 0:
             growth_rates.append((current / previous - 1) * 100)
+
+    compounded_sales = ranges_table(soup, "Compounded Sales Growth")
+    sales_3y = compounded_sales.get("3 Years")
+    sales_5y = compounded_sales.get("5 Years")
 
     if not growth_rates:
         return {
@@ -134,16 +136,26 @@ def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
             "observations": 0,
             "over_10_count": 0,
             "over_10_percentage": None,
+            "sales_3y": sales_3y,
+            "sales_5y": sales_5y,
             "rates": growth_rates,
         }
 
     over_10_count = sum(rate >= 10 for rate in growth_rates)
     over_10_percentage = over_10_count / len(growth_rates) * 100
+
+    compounded_pass = all_present(sales_3y, sales_5y) and sales_3y >= 12.0 and sales_5y >= 12.0
+    yoy_pass = over_10_percentage >= 70.0
+
     return {
-        "status": status(over_10_percentage >= 70),
+        "status": status(compounded_pass and yoy_pass),
         "observations": len(growth_rates),
         "over_10_count": over_10_count,
         "over_10_percentage": over_10_percentage,
+        "sales_3y": sales_3y,
+        "sales_5y": sales_5y,
+        "compounded_pass": compounded_pass,
+        "yoy_pass": yoy_pass,
         "rates": growth_rates,
     }
 
@@ -256,20 +268,42 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
         for period in profit_periods
     )
 
+    profit_3y = profit_periods.get("3 Years")
+    profit_5y = profit_periods.get("5 Years")
+    peg_ratio: float | None = None
+    effective_cagr: float | None = None
+    peg_pass: bool | None = None
+
+    if all_present(stock_pe, profit_3y, profit_5y):
+        if profit_3y > 0 and profit_5y > 0 and profit_3y >= 0.75 * profit_5y:
+            effective_cagr = (profit_3y + profit_5y) / 2.0
+            if effective_cagr > 0:
+                peg_ratio = stock_pe / effective_cagr
+                peg_pass = peg_ratio <= 1.5
+            else:
+                peg_pass = False
+        else:
+            peg_pass = False
+
+    compounded_sales = ranges_table(soup, "Compounded Sales Growth")
+    sales_3y = compounded_sales.get("3 Years")
+    sales_5y = compounded_sales.get("5 Years")
+
+    rev_quality_pass: bool | None = None
+    if all_present(profit_3y, profit_5y, sales_3y, sales_5y):
+        rev_quality_pass = (profit_3y >= sales_3y) and (profit_5y >= sales_5y)
+
     rule_statuses = {
         "pe_vs_industry": status(
-            stock_pe <= 1.25 * industry_pe if all_present(stock_pe, industry_pe) else None
+            stock_pe <= 1.35 * industry_pe if all_present(stock_pe, industry_pe) else None
         ),
         "pe_vs_historical": status(
             historical_pe_passes >= 2 if historical_pe_available >= 2 else None
         ),
-        "roce_over_10": status(ratios.get("ROCE") > 10 if ratios.get("ROCE") is not None else None),
-        "roe_over_10": status(ratios.get("ROE") > 10 if ratios.get("ROE") is not None else None),
+        "roce_over_15": status(ratios.get("ROCE") > 15 if ratios.get("ROCE") is not None else None),
+        "roe_over_15": status(ratios.get("ROE") > 15 if ratios.get("ROE") is not None else None),
         "debt_to_equity_under_0_5": status(
             ratios.get("Debt to equity") < 0.5 if ratios.get("Debt to equity") is not None else None
-        ),
-        "dpr_yoy_positive": status(
-            ratios.get("DPR YOY") > 0 if ratios.get("DPR YOY") is not None else None
         ),
         "pledged_zero": status(
             math.isclose(ratios.get("Pledged percentage"), 0.0, abs_tol=1e-9)
@@ -282,6 +316,8 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
             price_vs_profit_passes >= 2 if price_vs_profit_available else None
         ),
         "promoter_holding_decrease_under_5": promoter_holding_rule(soup)["status"],
+        "peg_ratio_under_1_5": status(peg_pass),
+        "revenue_quality_guard": status(rev_quality_pass),
     }
 
     sales = sales_growth_rule(soup)
@@ -300,6 +336,8 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
             "debt_to_equity": ratios.get("Debt to equity"),
             "dpr_yoy": ratios.get("DPR YOY"),
             "pledged_percentage": ratios.get("Pledged percentage"),
+            "peg_ratio": peg_ratio,
+            "effective_cagr": effective_cagr,
         },
         "profit_growth": profit_periods,
         "stock_price_cagr": price_periods,
@@ -342,6 +380,8 @@ def flatten_result(result: dict[str, Any]) -> dict[str, Any]:
         "sales_yoy_observations": sales.get("observations"),
         "sales_yoy_over_10_count": sales.get("over_10_count"),
         "sales_yoy_over_10_percentage": sales.get("over_10_percentage"),
+        "sales_growth_3_years": sales.get("sales_3y"),
+        "sales_growth_5_years": sales.get("sales_5y"),
         "promoter_first_period": promoter.get("first_period"),
         "promoter_first_value": promoter.get("first_value"),
         "promoter_last_period": promoter.get("last_period"),

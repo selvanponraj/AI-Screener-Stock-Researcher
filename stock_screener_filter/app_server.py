@@ -1406,15 +1406,16 @@ INDEX_HTML = r"""
       const names = {
         pe_vs_industry: 'PE/industry',
         pe_vs_historical: 'PE/history',
-        roce_over_10: 'ROCE',
-        roe_over_10: 'ROE',
+        roce_over_15: 'ROCE',
+        roe_over_15: 'ROE',
         debt_to_equity_under_0_5: 'D/E',
-        dpr_yoy_positive: 'DPR YoY',
         pledged_zero: 'Pledged',
         sales_yoy_growth: 'Sales YoY',
         profit_growth_over_10: 'Profit growth',
         stock_cagr_below_profit_growth: 'CAGR < profit',
         promoter_holding_decrease_under_5: 'Promoter',
+        peg_ratio_under_1_5: 'PEG <= 1.5',
+        revenue_quality_guard: 'Revenue Quality',
         rule_12_ssgr: 'SSGR',
         rule_13_cfo_ebitda: 'CFO/EBITDA'
       };
@@ -1560,10 +1561,10 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     }
     function ruleDetailsFromStock(stock) {
       const names = [
-        'pe_vs_industry','pe_vs_historical','roce_over_10','roe_over_10',
-        'debt_to_equity_under_0_5','dpr_yoy_positive','pledged_zero',
+        'pe_vs_industry','pe_vs_historical','roce_over_15','roe_over_15',
+        'debt_to_equity_under_0_5','pledged_zero',
         'sales_yoy_growth','profit_growth_over_10','stock_cagr_below_profit_growth',
-        'promoter_holding_decrease_under_5','rule_12_ssgr','rule_13_cfo_ebitda'
+        'promoter_holding_decrease_under_5','peg_ratio_under_1_5','revenue_quality_guard','rule_12_ssgr','rule_13_cfo_ebitda'
       ];
       return names.map(name => ({ name, status: stock[name] || '' }));
     }

@@ -19,15 +19,16 @@ CURRENT_RUN_DIR = PROJECT_ROOT / "data" / "current_run"
 FIRST_STAGE_RULE_COLUMNS = (
     "pe_vs_industry",
     "pe_vs_historical",
-    "roce_over_10",
-    "roe_over_10",
+    "roce_over_15",
+    "roe_over_15",
     "debt_to_equity_under_0_5",
-    "dpr_yoy_positive",
     "pledged_zero",
     "sales_yoy_growth",
     "profit_growth_over_10",
     "stock_cagr_below_profit_growth",
     "promoter_holding_decrease_under_5",
+    "peg_ratio_under_1_5",
+    "revenue_quality_guard",
 )
 EXCEL_RULE_COLUMNS = ("rule_12_ssgr", "rule_13_cfo_ebitda")
 TOTAL_RULES = len(FIRST_STAGE_RULE_COLUMNS) + len(EXCEL_RULE_COLUMNS)
@@ -329,15 +330,14 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
             f"passes {value(html_row, 'historical_pe_passes') or 'missing'} of "
             f"{value(html_row, 'historical_pe_available') or 'missing'} available"
         ),
-        "roce_over_10": f"ROCE {fmt_percent(numeric(html_row, 'roce'))} > 10%",
-        "roe_over_10": f"ROE {fmt_percent(numeric(html_row, 'roe'))} > 10%",
+        "roce_over_15": f"ROCE {fmt_percent(numeric(html_row, 'roce'))} > 15%",
+        "roe_over_15": f"ROE {fmt_percent(numeric(html_row, 'roe'))} > 15%",
         "debt_to_equity_under_0_5": f"Debt to equity {fmt_number(numeric(html_row, 'debt_to_equity'))} < 0.5",
-        "dpr_yoy_positive": f"DPR YoY {fmt_percent(numeric(html_row, 'dpr_yoy'))} > 0%",
         "pledged_zero": f"Pledged percentage {fmt_percent(numeric(html_row, 'pledged_percentage'))} = 0%",
         "sales_yoy_growth": (
-            f"{value(html_row, 'sales_yoy_over_10_count') or '0'} of "
-            f"{value(html_row, 'sales_yoy_observations') or '0'} available YoY sales observations >= 10%; "
-            f"hit rate {fmt_percent(numeric(html_row, 'sales_yoy_over_10_percentage'))}, threshold 70%"
+            f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))} (need >= 12%); "
+            f"YoY hit rate {value(html_row, 'sales_yoy_over_10_count') or '0'}/{value(html_row, 'sales_yoy_observations') or '0'} >= 10% "
+            f"({fmt_percent(numeric(html_row, 'sales_yoy_over_10_percentage'))}, threshold 70%)"
         ),
         "profit_growth_over_10": (
             "Profit growth 10Y/5Y/3Y/TTM = "
@@ -358,15 +358,28 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
             f"{fmt_percent(numeric(html_row, 'promoter_last_value'))}; "
             f"decrease {fmt_percent(numeric(html_row, 'promoter_decrease'))}, threshold < 5%"
         ),
+        "peg_ratio_under_1_5": (
+            f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
+            f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
+            f"Effective CAGR {fmt_percent(numeric(html_row, 'effective_cagr'))}, "
+            f"PEG {fmt_number(numeric(html_row, 'peg_ratio'))}; threshold <= 1.5"
+            if numeric(html_row, 'stock_pe') is not None or numeric(html_row, 'profit_growth_3_years') is not None
+            else "PEG evaluation data missing or fail guardrail (3Y/5Y growth > 0 and 3Y >= 75% of 5Y); threshold <= 1.5"
+        ),
+        "revenue_quality_guard": (
+            f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
+            f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))}; "
+            f"need Profit >= Sales for both 3Y and 5Y"
+        ),
         "rule_12_ssgr": (
-            f"SSGR E27:K27 values {value(excel_row, 'ssgr_values_e27_k27') or 'missing'}; "
-            f"{value(excel_row, 'ssgr_years_at_or_above_10') or '0'} years >= 10, "
-            f"need {value(excel_row, 'ssgr_minimum_years_at_or_above_10') or 'missing'}; "
-            f"all years positive = {value(excel_row, 'ssgr_all_years_positive') or 'missing'}"
+            f"3Y Avg SSGR {fmt_percent(numeric(excel_row, 'ssgr_3y_avg'))} > 10% "
+            f"and >= 3Y Excel Sales CAGR {fmt_percent(numeric(excel_row, 'excel_sales_cagr_3y'))}"
         ),
         "rule_13_cfo_ebitda": (
-            f"CFO/EBITDA last five values {value(excel_row, 'cfo_ebitda_last_five_values') or 'missing'}; "
-            f"average {fmt_percent(numeric(excel_row, 'cfo_ebitda_last_five_average'))}, threshold > 50%"
+            f"Cum 5Y CFO/EBITDA = {fmt_number(numeric(excel_row, 'cum_cfo_5y'))} / "
+            f"{fmt_number(numeric(excel_row, 'cum_ebitda_5y'))} = "
+            f"{fmt_percent(numeric(excel_row, 'cfo_ebitda_cum_ratio'))} (>= 65%); "
+            f"CFO/PAT = {fmt_percent(numeric(excel_row, 'cfo_pat_cum_ratio'))} (>= 80%)"
         ),
     }
     return details.get(rule, "")
@@ -632,8 +645,8 @@ def load_current_rule_filtered() -> list[dict[str, object]]:
         html_row = html_rows.get(row.get("company_url", ""), {})
         excel_row = excel_rows.get(row.get("company_url", ""), {})
         row["rule_details"] = build_rule_details(
-            {**{column: str(row.get(column, "")) for column in FIRST_STAGE_RULE_COLUMNS}, **html_row},
-            {**{column: str(row.get(column, "")) for column in EXCEL_RULE_COLUMNS}, **excel_row},
+            {**html_row, **{column: str(row.get(column, "")) for column in FIRST_STAGE_RULE_COLUMNS}},
+            {**excel_row, **{column: str(row.get(column, "")) for column in EXCEL_RULE_COLUMNS}},
         )
     return rows
 
@@ -649,6 +662,9 @@ def load_custom_stocks() -> list[dict[str, object]]:
         try:
             stock = json.loads(json_file.read_text(encoding="utf-8"))
             if isinstance(stock, dict) and "stock_id" in stock:
+                # Refresh rule_details using all stock fields so old saved custom JSONs get full details strings
+                stock_str_dict = {k: str(v) if v is not None else "" for k, v in stock.items()}
+                stock["rule_details"] = build_rule_details(stock_str_dict, stock_str_dict)
                 results.append(stock)
         except Exception:
             continue
@@ -707,7 +723,7 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
 
         # Step 2: Analyze HTML Rules
         html_analysis_dir = profiles_dir / "analysis"
-        log("Running 11 quantitative HTML rules...")
+        log("Running quantitative HTML rules...")
         run_command(
             [
                 sys.executable,
@@ -796,8 +812,8 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
             "rule_score_out_of_50": rule_score,
             "passes_final_rule_filter": True,
             "is_custom_single_stock": True,
-            **{column: html_row.get(column, "") for column in FIRST_STAGE_RULE_COLUMNS},
-            **{column: excel_row.get(column, "") for column in EXCEL_RULE_COLUMNS},
+            **html_row,
+            **excel_row,
             "rule_details": build_rule_details(html_row, excel_row),
         }
 

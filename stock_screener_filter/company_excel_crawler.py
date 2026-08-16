@@ -25,15 +25,16 @@ DEFAULT_COMPANY_DIR = Path("data") / "runs" / "20260625_updated_company_profiles
 RULE_COLUMNS = (
     "pe_vs_industry",
     "pe_vs_historical",
-    "roce_over_10",
-    "roe_over_10",
+    "roce_over_15",
+    "roe_over_15",
     "debt_to_equity_under_0_5",
-    "dpr_yoy_positive",
     "pledged_zero",
     "sales_yoy_growth",
     "profit_growth_over_10",
     "stock_cagr_below_profit_growth",
     "promoter_holding_decrease_under_5",
+    "peg_ratio_under_1_5",
+    "revenue_quality_guard",
 )
 
 

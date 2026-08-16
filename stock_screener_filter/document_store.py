@@ -92,7 +92,8 @@ def save_upload(
         raise RuntimeError("Document type must be either report or concall.")
     stock_raw_dir = RAW_DIR / stock_id
     stock_raw_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = stock_raw_dir / f".upload_{safe_name(filename)}"
+    import uuid
+    temp_path = stock_raw_dir / f".upload_{uuid.uuid4().hex}_{safe_name(filename)}"
     with temp_path.open("wb") as target:
         shutil.copyfileobj(source, target)
 

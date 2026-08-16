@@ -11,3 +11,4 @@ langgraph==0.2.76
 pydantic==2.10.6
 sentence-transformers==3.4.1
 ddgs==9.8.0
+bse==3.3.0
