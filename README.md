@@ -447,6 +447,16 @@ Run Excel rules:
 python -m stock_screener_filter.company_excel_rule_analyzer --excel-dir data/current_run/companies/excel --output-dir data/current_run/companies/excel/analysis
 ```
 
+Run single stock analysis (e.g., TCS):
+
+```bash
+# Uses cached single-stock analysis if already fetched under data/custom_stocks/
+python -m stock_screener_filter.rules_pipeline --ticker TCS
+
+# Force re-downloading fresh stock profile & Excel from Screener
+python -m stock_screener_filter.rules_pipeline --ticker TCS --force
+```
+
 On Windows PowerShell, quote paths if they contain spaces:
 
 ```powershell

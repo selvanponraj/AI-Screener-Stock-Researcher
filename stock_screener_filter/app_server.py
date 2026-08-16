@@ -23,12 +23,16 @@ PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
 
 def load_visible_stocks() -> list[dict[str, Any]]:
-    # Keep previously uploaded document-library stocks visible even when they are
-    # absent from the latest quantitative filter output.
+    # Keep batch rule-filtered, custom single-stock, and document-library stocks visible.
     stocks_by_id: dict[str, dict[str, Any]] = {}
     for stock in rules_pipeline.load_current_rule_filtered():
         stock_id = str(stock["stock_id"])
         stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
+
+    for stock in rules_pipeline.load_custom_stocks():
+        stock_id = str(stock["stock_id"])
+        if stock_id not in stocks_by_id:
+            stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
 
     for stock in document_store.stocks_with_documents():
         stock_id = str(stock["stock_id"])
@@ -59,48 +63,6 @@ class AppState:
         self.progress_total = 1
         self.current_step = "Idle"
 
-    def snapshot(self) -> dict[str, Any]:
-        with self.lock:
-            return {
-                "running": self.running,
-                "phase": self.phase,
-                "logs": list(self.logs),
-                "stocks": enrich_stocks(self.stocks),
-                "error": self.error,
-                "error_trace": self.error_trace,
-                "progress_current": self.progress_current,
-                "progress_total": self.progress_total,
-                "current_step": self.current_step,
-                "pipeline_steps": rules_pipeline.pipeline_status(pass_percentage=self.pass_percentage),
-                "pass_percentage": self.pass_percentage,
-            }
-
-
-STATE = AppState()
-
-
-def load_visible_stocks() -> list[dict[str, Any]]:
-    # Keep previously uploaded document-library stocks visible even when they are
-    # absent from the latest quantitative filter output.
-    stocks_by_id: dict[str, dict[str, Any]] = {}
-    for stock in rules_pipeline.load_current_rule_filtered():
-        stock_id = str(stock["stock_id"])
-        stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
-
-    for stock in document_store.stocks_with_documents():
-        stock_id = str(stock["stock_id"])
-        if stock_id not in stocks_by_id:
-            stocks_by_id[stock_id] = dict(stock)
-
-    return sorted(
-        stocks_by_id.values(),
-        key=lambda stock: (
-            0 if stock.get("stock_source") == "rule_filtered" else 1,
-            str(stock.get("company_name", "")).lower(),
-        ),
-    )
-
-
     def log(self, message: str) -> None:
         with self.lock:
             self.logs.append(message)
@@ -113,14 +75,14 @@ def load_visible_stocks() -> list[dict[str, Any]]:
                 disk_stocks = load_visible_stocks()
                 if disk_stocks:
                     self.stocks = disk_stocks
-                steps = rules_pipeline.pipeline_status()
+                steps = rules_pipeline.pipeline_status(pass_percentage=self.pass_percentage)
                 if self.error and failed_step_is_now_complete(self.error, steps):
                     self.error = None
                     self.error_trace = None
                     self.phase = "idle"
                     self.current_step = "Idle"
             else:
-                steps = rules_pipeline.pipeline_status()
+                steps = rules_pipeline.pipeline_status(pass_percentage=self.pass_percentage)
             return {
                 "running": self.running,
                 "phase": self.phase,
@@ -136,6 +98,7 @@ def load_visible_stocks() -> list[dict[str, Any]]:
                 "stocks": enrich_stocks(self.stocks),
                 "error": self.error,
                 "error_trace": self.error_trace,
+                "pass_percentage": self.pass_percentage,
             }
 
     def progress(self, current: int, total: int, step: str) -> None:
@@ -189,7 +152,8 @@ def run_pipeline_background() -> None:
         STATE.progress_total = 7
         STATE.current_step = "Starting"
     try:
-        stocks = rules_pipeline.run_full_pipeline(STATE.log, progress=STATE.progress)
+        pass_pct = STATE.pass_percentage
+        stocks = rules_pipeline.run_full_pipeline(STATE.log, progress=STATE.progress, pass_percentage=pass_pct)
         with STATE.lock:
             STATE.stocks = load_visible_stocks()
             STATE.phase = "pipeline complete"
@@ -218,7 +182,8 @@ def run_step_background(step_id: str) -> None:
         STATE.progress_total = 1
         STATE.current_step = step_id
     try:
-        stocks = rules_pipeline.run_step(step_id, STATE.log, progress=STATE.progress)
+        pass_pct = STATE.pass_percentage
+        stocks = rules_pipeline.run_step(step_id, STATE.log, progress=STATE.progress, pass_percentage=pass_pct)
         with STATE.lock:
             if stocks:
                 STATE.stocks = load_visible_stocks()
@@ -307,8 +272,52 @@ class Handler(BaseHTTPRequestHandler):
             self.ask_documents()
         elif parsed.path == "/api/set-threshold":
             self.set_threshold()
+        elif parsed.path == "/api/analyze-ticker":
+            self.analyze_ticker()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def analyze_ticker(self) -> None:
+        with STATE.lock:
+            if STATE.running:
+                self.send_json({"ok": False, "error": "A job is already running."}, status=409)
+                return
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        ticker = payload.get("ticker", "").strip()
+        if not ticker:
+            self.send_json({"ok": False, "error": "Ticker input cannot be empty."}, status=400)
+            return
+
+        def run_single_stock_bg() -> None:
+            with STATE.lock:
+                STATE.running = True
+                STATE.phase = f"analyzing single stock: {ticker}"
+                STATE.error = None
+                STATE.error_trace = None
+                STATE.logs = []
+                STATE.current_step = f"Analyzing {ticker}"
+            try:
+                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=True)
+                with STATE.lock:
+                    STATE.stocks = load_visible_stocks()
+                    STATE.phase = f"single stock complete: {stock_data.get('company_name', ticker)}"
+                    STATE.current_step = "Analysis complete"
+            except Exception as exc:
+                trace = traceback.format_exc()
+                STATE.log(trace)
+                with STATE.lock:
+                    STATE.error = str(exc)
+                    STATE.error_trace = trace
+                    STATE.phase = "single stock analysis failed"
+                    STATE.current_step = "Analysis failed"
+            finally:
+                with STATE.lock:
+                    STATE.running = False
+
+        thread = threading.Thread(target=run_single_stock_bg, daemon=True)
+        thread.start()
+        self.send_json({"ok": True})
 
     def set_threshold(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -978,7 +987,18 @@ INDEX_HTML = r"""
   <header>
     <h1>Stock Researcher</h1>
       <div class="toolbar">
+      <div style="display:flex; align-items:center; gap:6px; background:#f5f7fa; padding:3px 8px; border-radius:6px; border:1px solid var(--line);">
+        <input id="tickerInput" type="text" placeholder="Ticker (e.g. TCS)" style="width:130px; padding:4px 8px; font-size:13px; border:1px solid var(--line); border-radius:4px;" />
+        <button id="analyzeTickerBtn" class="secondary" style="padding:4px 10px; font-size:13px;">Analyze Ticker</button>
+      </div>
       <label style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
+        Show:
+        <select id="viewFilterSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
+          <option value="single">Single Stocks Only</option>
+          <option value="batch">Batch Screener Stocks Only</option>
+        </select>
+      </label>
+      <label id="thresholdLabel" style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
         Pass Threshold:
         <select id="thresholdSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
           <option value="50">>= 50%</option>
@@ -988,6 +1008,7 @@ INDEX_HTML = r"""
           <option value="90">>= 90%</option>
           <option value="100">100%</option>
         </select>
+        <span id="thresholdNaBadge" style="display:none; padding:3px 8px; background:#eef2f7; color:var(--muted); border-radius:4px; font-weight:normal;">N/A</span>
       </label>
       <button id="refreshBtn" class="secondary">Refresh</button>
       <button id="runBtn">Run Screener Pipeline</button>
@@ -1063,6 +1084,8 @@ INDEX_HTML = r"""
       $('logs').textContent = (latest.logs || []).slice(-120).join('\n');
       $('runBtn').disabled = latest.running;
       $('evalAllBtn').disabled = latest.running || !latest.stocks.length;
+      if ($('analyzeTickerBtn')) $('analyzeTickerBtn').disabled = latest.running;
+      if ($('tickerInput')) $('tickerInput').disabled = latest.running;
       if (!latest.running) {
         evaluatingStockId = '';
       }
@@ -1100,6 +1123,8 @@ INDEX_HTML = r"""
       });
     }
 
+    let activeSingleTicker = '';
+
     function renderStocks(stocks) {
       const body = $('stocks');
       // Polling rebuilds the table, so capture disclosure state before replacing its rows.
@@ -1111,11 +1136,36 @@ INDEX_HTML = r"""
         Array.from(document.querySelectorAll('details.qa-trace[open]'))
           .map(detail => detail.dataset.stock)
       );
+      const viewMode = ($('viewFilterSelect') && $('viewFilterSelect').value) || 'single';
+      if ($('thresholdSelect') && $('thresholdNaBadge')) {
+        if (viewMode === 'single') {
+          $('thresholdSelect').style.display = 'none';
+          $('thresholdNaBadge').style.display = 'inline-block';
+        } else {
+          $('thresholdSelect').style.display = 'inline-block';
+          $('thresholdNaBadge').style.display = 'none';
+        }
+      }
+      const visibleStocks = stocks.filter(stock => {
+        if (viewMode === 'single') {
+          if (!stock.is_custom_single_stock) return false;
+          if (!activeSingleTicker) return false;
+          const search = activeSingleTicker.toLowerCase();
+          return stock.company_name.toLowerCase().includes(search) || 
+                 stock.company_url.toLowerCase().includes(`/${search}/`) ||
+                 stock.stock_id.toLowerCase().includes(search);
+        }
+        return !stock.is_custom_single_stock;
+      });
       body.innerHTML = '';
-      $('uploadPrompt').textContent = stocks.length
-        ? `Upload reports or concalls for filtered stocks and document-library stocks. Duplicate files are skipped automatically.`
-        : 'Run the Screener pipeline or upload documents for stocks already present in the document library.';
-      for (const stock of stocks) {
+      $('uploadPrompt').textContent = viewMode === 'single'
+        ? (activeSingleTicker
+            ? `Single stock mode active (Pass Threshold: N/A). Showing analyzed results for "${activeSingleTicker}".`
+            : `Enter a stock ticker (e.g. TCS) in the input box above and click "Analyze Ticker".`)
+        : (visibleStocks.length
+          ? `Upload reports or concalls for filtered stocks and document-library stocks. Duplicate files are skipped automatically.`
+          : 'Run single stock analysis or Screener pipeline to view stocks.');
+      for (const stock of visibleStocks) {
         const tr = document.createElement('tr');
         const docs = stock.documents || [];
         const ai = stock.ai_evaluation || {};
@@ -1129,7 +1179,7 @@ INDEX_HTML = r"""
             <div class="stock-name">${escapeHtml(stock.company_name)}</div>
             <div class="muted">${escapeHtml(stock.market_categories || '')}</div>
             <div class="muted">${escapeHtml(stock.company_url || '')}</div>
-            <div class="muted">${isRuleFiltered ? 'Rule filtered' : 'Document library'}</div>
+            <div class="muted">${stock.is_custom_single_stock ? 'Single stock' : (isRuleFiltered ? 'Rule filtered' : 'Document library')}</div>
           </td>
           <td>
             ${isRuleFiltered ? `
@@ -1518,12 +1568,45 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
       return names.map(name => ({ name, status: stock[name] || '' }));
     }
 
+    async function handleAnalyzeTicker() {
+      const input = $('tickerInput');
+      const val = input.value.trim();
+      if (!val) {
+        alert('Please enter a stock ticker (e.g. TCS)');
+        return;
+      }
+      activeSingleTicker = val;
+      if ($('viewFilterSelect')) $('viewFilterSelect').value = 'single';
+      try {
+        await api('/api/analyze-ticker', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker: val })
+        });
+        await refresh();
+      } catch (err) {
+        alert(`Failed to trigger ticker analysis: ${err.message}`);
+      }
+    }
+    $('analyzeTickerBtn').addEventListener('click', handleAnalyzeTicker);
+    $('tickerInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleAnalyzeTicker();
+    });
+    $('tickerInput').addEventListener('input', (e) => {
+      activeSingleTicker = e.target.value.trim();
+      if ($('viewFilterSelect') && $('viewFilterSelect').value === 'single') {
+        renderStocks(latest.stocks || []);
+      }
+    });
     $('runBtn').addEventListener('click', async () => {
       await api('/api/run', { method: 'POST' });
       await refresh();
     });
     $('refreshBtn').addEventListener('click', refresh);
     $('evalAllBtn').addEventListener('click', () => evaluate(''));
+    $('viewFilterSelect').addEventListener('change', () => {
+      renderStocks(latest.stocks || []);
+    });
     $('thresholdSelect').addEventListener('change', async (e) => {
       const val = parseFloat(e.target.value);
       await api('/api/set-threshold', {

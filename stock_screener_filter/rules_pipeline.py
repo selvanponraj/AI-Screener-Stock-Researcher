@@ -562,6 +562,7 @@ def stock_id(company_name: str, company_url: str) -> str:
 def run_full_pipeline(
     log: Callable[[str], None],
     progress: Callable[[int, int, str], None] | None = None,
+    pass_percentage: float | None = None,
 ) -> list[dict[str, object]]:
     paths = clean_current_run()
     log(f"Cleaned fresh run directory: {paths.run_dir}")
@@ -576,11 +577,12 @@ def run_full_pipeline(
             progress(index, total_steps, label)
     if progress:
         progress(len(commands), total_steps, "Combine 13-rule outputs")
-    filtered = combine_rule_outputs(paths)
+    filtered = combine_rule_outputs(paths, pass_percentage=pass_percentage)
     if progress:
         progress(total_steps, total_steps, "Pipeline complete")
+    target_pct = pass_percentage if pass_percentage is not None else FINAL_RULE_PASS_PERCENTAGE
     log(
-        f"Saved final >={FINAL_RULE_PASS_PERCENTAGE}% rule-filtered stocks: "
+        f"Saved final >={target_pct}% rule-filtered stocks: "
         f"{paths.final_dir / 'rule_filtered_stocks.csv'}"
     )
     log(f"Rule-filtered stock count: {len(filtered)}")
@@ -591,6 +593,7 @@ def run_step(
     step_id: str,
     log: Callable[[str], None],
     progress: Callable[[int, int, str], None] | None = None,
+    pass_percentage: float | None = None,
 ) -> list[dict[str, object]]:
     paths = current_paths()
     paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -602,7 +605,7 @@ def run_step(
     run_command(command, log)
     filtered: list[dict[str, object]] = []
     if step_id == "excel_rules":
-        filtered = combine_rule_outputs(paths)
+        filtered = combine_rule_outputs(paths, pass_percentage=pass_percentage)
         log(f"Rule-filtered stock count: {len(filtered)}")
     if progress:
         progress(1, 1, f"{label} complete")
@@ -633,3 +636,208 @@ def load_current_rule_filtered() -> list[dict[str, object]]:
             {**{column: str(row.get(column, "")) for column in EXCEL_RULE_COLUMNS}, **excel_row},
         )
     return rows
+
+
+CUSTOM_STOCKS_DIR = PROJECT_ROOT / "data" / "custom_stocks"
+
+
+def load_custom_stocks() -> list[dict[str, object]]:
+    if not CUSTOM_STOCKS_DIR.exists():
+        return []
+    results: list[dict[str, object]] = []
+    for json_file in CUSTOM_STOCKS_DIR.glob("*.json"):
+        try:
+            stock = json.loads(json_file.read_text(encoding="utf-8"))
+            if isinstance(stock, dict) and "stock_id" in stock:
+                results.append(stock)
+        except Exception:
+            continue
+    return results
+
+
+def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: bool = False) -> dict[str, object]:
+    input_str = ticker_or_url.strip()
+    if not input_str:
+        raise ValueError("Ticker or URL cannot be empty.")
+
+    if input_str.startswith("http://") or input_str.startswith("https://"):
+        company_url = input_str if input_str.endswith("/") else f"{input_str}/"
+    else:
+        symbol = input_str.upper().strip("/")
+        company_url = f"https://www.screener.in/company/{symbol}/"
+
+    CUSTOM_STOCKS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Check if stock already exists in custom_stocks cache
+    if not force:
+        for json_file in CUSTOM_STOCKS_DIR.glob("*.json"):
+            try:
+                cached = json.loads(json_file.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and cached.get("company_url", "").rstrip("/") == company_url.rstrip("/"):
+                    log(f"Found cached single stock analysis for {cached.get('company_name', symbol)} ({json_file.name}). Skipping re-download.")
+                    return cached
+            except Exception:
+                continue
+
+    log(f"Analyzing single stock ticker from Screener: {company_url}")
+    temp_dir = CUSTOM_STOCKS_DIR / "_temp_run"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Step 1: Download Profile HTML (Headless mode)
+        profiles_dir = temp_dir / "profiles"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        log(f"Fetching profile HTML for {company_url}...")
+        run_command(
+            [
+                sys.executable,
+                "-m",
+                "stock_screener_filter.company_profile_crawler",
+                "--company-urls",
+                company_url,
+                "--output-dir",
+                str(profiles_dir),
+                "--delay-seconds",
+                "1",
+            ],
+            log,
+        )
+
+        # Step 2: Analyze HTML Rules
+        html_analysis_dir = profiles_dir / "analysis"
+        log("Running 11 quantitative HTML rules...")
+        run_command(
+            [
+                sys.executable,
+                "-m",
+                "stock_screener_filter.company_rule_analyzer",
+                "--company-dir",
+                str(profiles_dir),
+                "--output-dir",
+                str(html_analysis_dir),
+            ],
+            log,
+        )
+
+        html_csv = html_analysis_dir / "company_rule_results.csv"
+        if not html_csv.is_file():
+            raise RuntimeError(f"HTML rule analysis failed to produce results for {company_url}")
+
+        with html_csv.open(newline="", encoding="utf-8") as csv_file:
+            html_rows = list(csv.DictReader(csv_file))
+        if not html_rows:
+            raise RuntimeError(f"No HTML rule output found for {company_url}")
+        html_row = html_rows[0]
+
+        # Step 3: Download Excel Export
+        excel_dir = profiles_dir / "excel"
+        log("Downloading Screener Excel export...")
+        run_command(
+            [
+                sys.executable,
+                "-m",
+                "stock_screener_filter.company_excel_crawler",
+                "--analysis-csv",
+                str(html_csv),
+                "--output-dir",
+                str(excel_dir),
+                "--min-passing-rules",
+                "0",  # Always fetch Excel for single stock analysis
+                "--delay-seconds",
+                "1",
+            ],
+            log,
+        )
+
+        # Step 4: Analyze Excel Rules
+        excel_analysis_dir = excel_dir / "analysis"
+        log("Running Excel SSGR & CFO/EBITDA rules...")
+        run_command(
+            [
+                sys.executable,
+                "-m",
+                "stock_screener_filter.company_excel_rule_analyzer",
+                "--excel-dir",
+                str(excel_dir),
+                "--output-dir",
+                str(excel_analysis_dir),
+            ],
+            log,
+        )
+
+        excel_csv = excel_analysis_dir / "excel_rule_results.csv"
+        excel_row: dict[str, str] = {}
+        if excel_csv.is_file():
+            with excel_csv.open(newline="", encoding="utf-8") as csv_file:
+                excel_rows = list(csv.DictReader(csv_file))
+                if excel_rows:
+                    excel_row = excel_rows[0]
+
+        first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
+        excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
+        total_passes = first_passes + excel_passes
+        rule_score = round((total_passes / TOTAL_RULES) * 50, 2)
+
+        s_id = stock_id(html_row["company_name"], html_row["company_url"])
+        stock_data: dict[str, object] = {
+            "stock_id": s_id,
+            "company_name": html_row["company_name"],
+            "company_url": html_row["company_url"],
+            "html_file": html_row.get("html_file", ""),
+            "excel_file": excel_row.get("excel_file", ""),
+            "market_categories": html_row.get("market_categories", ""),
+            "first_11_pass_count": first_passes,
+            "excel_rule_pass_count": excel_passes,
+            "total_rule_pass_count": total_passes,
+            "total_rule_count": TOTAL_RULES,
+            "rule_pass_percentage": round((total_passes / TOTAL_RULES) * 100, 2),
+            "rule_score_out_of_50": rule_score,
+            "passes_final_rule_filter": True,
+            "is_custom_single_stock": True,
+            **{column: html_row.get(column, "") for column in FIRST_STAGE_RULE_COLUMNS},
+            **{column: excel_row.get(column, "") for column in EXCEL_RULE_COLUMNS},
+            "rule_details": build_rule_details(html_row, excel_row),
+        }
+
+        save_path = CUSTOM_STOCKS_DIR / f"{s_id}.json"
+        save_path.write_text(json.dumps(stock_data, indent=2), encoding="utf-8")
+        log(f"Successfully analyzed {html_row['company_name']}! Saved to custom stocks.")
+        return stock_data
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Stock Screener & Rules Pipeline Runner")
+    parser.add_argument("action", nargs="?", default="run", choices=["run", "status"])
+    parser.add_argument("--step", help="Specific step to run: login, screens, profiles, html_rules, excel_downloads, excel_rules")
+    parser.add_argument("--ticker", help="Analyze a single stock ticker or URL (e.g. TCS or https://www.screener.in/company/TCS/)")
+    parser.add_argument("--force", action="store_true", help="Bypass cache and force re-fetching single stock analysis")
+    args = parser.parse_args()
+
+    def log(msg: str) -> None:
+        print(f"[PIPELINE] {msg}")
+
+    if args.ticker:
+        analyze_single_stock(args.ticker, log, force=args.force)
+        return 0
+
+    if args.action == "status":
+        print(json.dumps(pipeline_status(), indent=2))
+        return 0
+
+    if args.step:
+        run_step(args.step, log)
+    else:
+        run_full_pipeline(log)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
