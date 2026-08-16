@@ -31,7 +31,7 @@ FIRST_STAGE_RULE_COLUMNS = (
 )
 EXCEL_RULE_COLUMNS = ("rule_12_ssgr", "rule_13_cfo_ebitda")
 TOTAL_RULES = len(FIRST_STAGE_RULE_COLUMNS) + len(EXCEL_RULE_COLUMNS)
-FINAL_RULE_PASS_PERCENTAGE = 75
+FINAL_RULE_PASS_PERCENTAGE = 100
 FINAL_RULE_PASS_THRESHOLD = math.ceil(TOTAL_RULES * FINAL_RULE_PASS_PERCENTAGE / 100)
 PIPELINE_STEPS = (
     "login",
@@ -390,7 +390,9 @@ def build_rule_details(html_row: dict[str, str], excel_row: dict[str, str]) -> l
     ]
 
 
-def combine_rule_outputs(paths: PipelinePaths) -> list[dict[str, object]]:
+def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = None) -> list[dict[str, object]]:
+    pct = pass_percentage if pass_percentage is not None else FINAL_RULE_PASS_PERCENTAGE
+    threshold = math.ceil(TOTAL_RULES * pct / 100)
     html_csv = paths.html_analysis_dir / "company_rule_results.csv"
     excel_csv = paths.excel_analysis_dir / "excel_rule_results.csv"
     if not html_csv.is_file() or not excel_csv.is_file():
@@ -425,7 +427,7 @@ def combine_rule_outputs(paths: PipelinePaths) -> list[dict[str, object]]:
                 "total_rule_count": TOTAL_RULES,
                 "rule_pass_percentage": round((total_passes / TOTAL_RULES) * 100, 2),
                 "rule_score_out_of_50": rule_score,
-                "passes_final_rule_filter": total_passes >= FINAL_RULE_PASS_THRESHOLD,
+                "passes_final_rule_filter": total_passes >= threshold,
                 **{column: html_row.get(column, "") for column in FIRST_STAGE_RULE_COLUMNS},
                 **{column: excel_row.get(column, "") for column in EXCEL_RULE_COLUMNS},
                 "rule_details": build_rule_details(html_row, excel_row),
@@ -471,7 +473,8 @@ def company_code(company_url: str) -> str:
     return parts[-1] if parts else "company"
 
 
-def pipeline_status() -> list[dict[str, object]]:
+def pipeline_status(pass_percentage: float | None = None) -> list[dict[str, object]]:
+    pct = pass_percentage if pass_percentage is not None else FINAL_RULE_PASS_PERCENTAGE
     paths = current_paths()
     screen_manifest = read_json_list(paths.screens_dir / "manifest.json")
     company_manifest = read_json_list(paths.companies_dir / "manifest.json")
@@ -541,7 +544,7 @@ def pipeline_status() -> list[dict[str, object]]:
             "id": "excel_rules",
             "label": "Excel rules",
             "complete": excel_rows > 0,
-            "summary": f"{excel_rows} Excel files analyzed; {len(filtered)} stocks pass >={FINAL_RULE_PASS_PERCENTAGE}%",
+            "summary": f"{excel_rows} Excel files analyzed; {len(filtered)} stocks pass >={pct:g}%",
         },
     ]
 

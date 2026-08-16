@@ -51,12 +51,55 @@ class AppState:
         self.running = False
         self.phase = "idle"
         self.logs: list[str] = []
+        self.pass_percentage = 90.0
         self.stocks: list[dict[str, Any]] = load_visible_stocks()
         self.error: str | None = None
         self.error_trace: str | None = None
         self.progress_current = 0
         self.progress_total = 1
         self.current_step = "Idle"
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "running": self.running,
+                "phase": self.phase,
+                "logs": list(self.logs),
+                "stocks": enrich_stocks(self.stocks),
+                "error": self.error,
+                "error_trace": self.error_trace,
+                "progress_current": self.progress_current,
+                "progress_total": self.progress_total,
+                "current_step": self.current_step,
+                "pipeline_steps": rules_pipeline.pipeline_status(pass_percentage=self.pass_percentage),
+                "pass_percentage": self.pass_percentage,
+            }
+
+
+STATE = AppState()
+
+
+def load_visible_stocks() -> list[dict[str, Any]]:
+    # Keep previously uploaded document-library stocks visible even when they are
+    # absent from the latest quantitative filter output.
+    stocks_by_id: dict[str, dict[str, Any]] = {}
+    for stock in rules_pipeline.load_current_rule_filtered():
+        stock_id = str(stock["stock_id"])
+        stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
+
+    for stock in document_store.stocks_with_documents():
+        stock_id = str(stock["stock_id"])
+        if stock_id not in stocks_by_id:
+            stocks_by_id[stock_id] = dict(stock)
+
+    return sorted(
+        stocks_by_id.values(),
+        key=lambda stock: (
+            0 if stock.get("stock_source") == "rule_filtered" else 1,
+            str(stock.get("company_name", "")).lower(),
+        ),
+    )
+
 
     def log(self, message: str) -> None:
         with self.lock:
@@ -262,8 +305,22 @@ class Handler(BaseHTTPRequestHandler):
             self.start_evaluation()
         elif parsed.path == "/api/ask":
             self.ask_documents()
+        elif parsed.path == "/api/set-threshold":
+            self.set_threshold()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def set_threshold(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        pct = float(payload.get("pass_percentage", 90.0))
+        with STATE.lock:
+            STATE.pass_percentage = pct
+            paths = rules_pipeline.current_paths()
+            if (paths.html_analysis_dir / "company_rule_results.csv").is_file() and (paths.excel_analysis_dir / "excel_rule_results.csv").is_file():
+                rules_pipeline.combine_rule_outputs(paths, pass_percentage=pct)
+                STATE.stocks = load_visible_stocks()
+        self.send_json({"ok": True, "pass_percentage": pct})
 
     def start_pipeline(self) -> None:
         with STATE.lock:
@@ -921,6 +978,17 @@ INDEX_HTML = r"""
   <header>
     <h1>Stock Researcher</h1>
       <div class="toolbar">
+      <label style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
+        Pass Threshold:
+        <select id="thresholdSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
+          <option value="50">>= 50%</option>
+          <option value="60">>= 60%</option>
+          <option value="75">>= 75%</option>
+          <option value="85">>= 85%</option>
+          <option value="90">>= 90%</option>
+          <option value="100">100%</option>
+        </select>
+      </label>
       <button id="refreshBtn" class="secondary">Refresh</button>
       <button id="runBtn">Run Screener Pipeline</button>
     </div>
@@ -950,7 +1018,7 @@ INDEX_HTML = r"""
     </aside>
     <section>
       <div id="uploadPrompt" class="prompt">
-        Run the Screener pipeline. Once stocks pass the 75% rule filter, upload reports or concalls here for each stock.
+        Run the Screener pipeline. Once stocks pass the rule filter threshold, upload reports or concalls here for each stock.
       </div>
       <table>
         <thead>
@@ -1456,8 +1524,21 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     });
     $('refreshBtn').addEventListener('click', refresh);
     $('evalAllBtn').addEventListener('click', () => evaluate(''));
+    $('thresholdSelect').addEventListener('change', async (e) => {
+      const val = parseFloat(e.target.value);
+      await api('/api/set-threshold', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pass_percentage: val })
+      });
+      await refresh();
+    });
     setInterval(refresh, 4000);
-    refresh();
+    refresh().then(() => {
+      if (latest.pass_percentage) {
+        $('thresholdSelect').value = String(latest.pass_percentage);
+      }
+    });
   </script>
 </body>
 </html>
