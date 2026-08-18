@@ -275,13 +275,15 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
     peg_pass: bool | None = None
 
     if all_present(stock_pe, profit_3y, profit_5y):
-        if profit_3y > 0 and profit_5y > 0 and profit_3y >= 0.75 * profit_5y:
+        if profit_3y > 0 and profit_5y > 0:
             effective_cagr = (profit_3y + profit_5y) / 2.0
             if effective_cagr > 0:
                 peg_ratio = stock_pe / effective_cagr
-                peg_pass = peg_ratio <= 1.5
-            else:
-                peg_pass = False
+            peg_pass = (
+                profit_3y >= 0.75 * profit_5y
+                and peg_ratio is not None
+                and peg_ratio <= 1.5
+            )
         else:
             peg_pass = False
 
@@ -295,7 +297,7 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
 
     rule_statuses = {
         "pe_vs_industry": status(
-            stock_pe <= 1.35 * industry_pe if all_present(stock_pe, industry_pe) else None
+            stock_pe <= 1.1 * industry_pe if all_present(stock_pe, industry_pe) else None
         ),
         "pe_vs_historical": status(
             historical_pe_passes >= 2 if historical_pe_available >= 2 else None

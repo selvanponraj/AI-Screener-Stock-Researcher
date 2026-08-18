@@ -22,12 +22,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 AI_DIR = PROJECT_ROOT / "data" / "ai_evaluations"
 QA_RUNS_DIR = PROJECT_ROOT / "data" / "qa_runs"
 SEARCH_CACHE_DIR = PROJECT_ROOT / "data" / "search_cache"
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gpt-5.6-luna"
+DEFAULT_BASE_URL = "http://132.145.30.2:4000/v1"
+DEFAULT_API_KEY = "sk-RP-0EUNkb5NE1ea3ZmO_Pw"
 DEFAULT_MIN_RAG_SIMILARITY_SCORE = 0.30
-LEGACY_MODEL_ALIASES = {
-    "gemini-2.5-flash": DEFAULT_MODEL,
-}
-GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
 class SectionAnalysis(BaseModel):
@@ -544,51 +542,92 @@ Return concise JSON matching the response schema. The final verdict should be pr
 """.strip()
 
 
-def gemini_json(
+def litellm_json(
     prompt: str,
+    base_url: str,
     api_key: str,
     model: str,
     response_schema: dict[str, Any],
 ) -> tuple[dict[str, Any], str, list[dict[str, str]], dict[str, Any]]:
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
     payload: dict[str, Any] = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseFormat": {
-                "text": {
-                    "mimeType": "APPLICATION_JSON",
-                    "schema": response_schema,
-                },
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a financial analyst assistant. Output strictly valid JSON matching the requested schema.",
             },
-        },
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
     }
     response = requests.post(
-        GENERATE_CONTENT_URL.format(model=model),
-        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        endpoint,
+        headers=headers,
         json=payload,
-        timeout=90,
+        timeout=120,
     )
     if not response.ok:
-        raise RuntimeError(f"Gemini request failed: {response.status_code} {response.text}")
+        raise RuntimeError(f"LiteLLM request failed ({response.status_code}): {response.text}")
     raw_payload = response.json()
-    text = extract_generate_content_text(raw_payload)
-    return json_from_text(text), text, extract_generate_content_citations(raw_payload), raw_payload
+    choices = raw_payload.get("choices", [])
+    if not choices:
+        raise RuntimeError(f"LiteLLM returned empty choices: {raw_payload}")
+    text = choices[0].get("message", {}).get("content", "")
+    citations: list[dict[str, str]] = []
+    return json_from_text(text), text, citations, raw_payload
 
 
-def gemini_settings() -> tuple[str, str]:
+def litellm_settings() -> tuple[str, str, str]:
     load_env()
-    api_key = os.environ.get("GEMINI_API_KEY")
-    configured_model = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
-    model = LEGACY_MODEL_ALIASES.get(configured_model, configured_model)
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set. Add it to the local .env file and restart the app.")
-    return api_key, model
+    base_url = os.environ.get("LITELLM_BASE_URL", DEFAULT_BASE_URL)
+    api_key = os.environ.get("LITELLM_API_KEY", DEFAULT_API_KEY)
+    model = os.environ.get("LITELLM_MODEL", DEFAULT_MODEL)
+    return base_url, api_key, model
+
+
+def ensure_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts = [f"{k}: {ensure_str(v)}" for k, v in value.items()]
+        return "\n".join(parts)
+    if isinstance(value, list):
+        return "\n".join(ensure_str(item) for item in value if item is not None)
+    return str(value)
+
+
+def ensure_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        res = []
+        for item in value:
+            if item is None:
+                continue
+            s = ensure_str(item)
+            if s.strip():
+                res.append(s)
+        return res
+    if isinstance(value, dict):
+        return [f"{k}: {ensure_str(v)}" for k, v in value.items()]
+    s = ensure_str(value)
+    return [s] if s.strip() else []
 
 
 def validate_section(parsed: dict[str, Any], spec: QuestionSpec) -> dict[str, Any]:
     parsed["question_id"] = spec.question_id
+    parsed["answer"] = ensure_str(parsed.get("answer"))
+    parsed["evidence_summary"] = ensure_str_list(parsed.get("evidence_summary"))
     parsed["confidence_score"] = clamp_score(parsed.get("confidence_score", 0))
     parsed["risk_score"] = clamp_score(parsed.get("risk_score", 0))
+    parsed["open_questions"] = ensure_str_list(parsed.get("open_questions"))
     try:
         section = SectionAnalysis.model_validate(parsed)
     except ValidationError as exc:
@@ -627,6 +666,14 @@ def validate_evaluation(parsed: dict[str, Any], stock: dict[str, Any]) -> dict[s
     parsed["news_sentiment_score"] = clamp_score(parsed.get("news_sentiment_score", 50))
     parsed["industry_outlook_score"] = clamp_score(parsed.get("industry_outlook_score", 50))
     parsed["exaggeration_risk_score"] = clamp_score(parsed.get("exaggeration_risk_score", 50))
+
+    parsed["verdict"] = ensure_str(parsed.get("verdict"))
+    parsed["future_outlook"] = ensure_str(parsed.get("future_outlook"))
+    parsed["initiatives_progress"] = ensure_str(parsed.get("initiatives_progress"))
+    parsed["promise_delivery"] = ensure_str(parsed.get("promise_delivery"))
+    parsed["key_reasons"] = ensure_str_list(parsed.get("key_reasons"))
+    parsed["open_questions"] = ensure_str_list(parsed.get("open_questions"))
+
     try:
         evaluation = StockEvaluation.model_validate(parsed)
     except ValidationError as exc:
@@ -752,9 +799,10 @@ Rules:
 - Return document_types using only report or concall.
 """.strip()
     try:
-        api_key, model = gemini_settings()
-        parsed, _raw_text, _citations, _raw_payload = gemini_json(
+        base_url, api_key, model = litellm_settings()
+        parsed, _raw_text, _citations, _raw_payload = litellm_json(
             prompt,
+            base_url,
             api_key,
             model,
             DOCUMENT_FILTER_RESPONSE_SCHEMA,
@@ -765,7 +813,7 @@ Rules:
     except Exception:
         pass
 
-    # Metadata inference must not make document Q&A unavailable when Gemini fails.
+    # Metadata inference must not make document Q&A unavailable when LLM fails.
     fallback = regex_document_filters(question)
     return {
         "apply_metadata_filter": bool(
@@ -781,10 +829,11 @@ def analyze_question(state: EvaluationState, spec: QuestionSpec) -> EvaluationSt
     search_results = external_search_results(state["stock"], spec) if spec.search_kind != "none" else []
     context = format_search_context(search_results) if spec.search_kind != "none" else format_rag_context(chunks)
     prompt = build_section_prompt(state["stock"], spec, context)
-    api_key, model = gemini_settings()
+    base_url, api_key, model = litellm_settings()
     try:
-        parsed, raw_text, citations, raw_payload = gemini_json(
+        parsed, raw_text, citations, raw_payload = litellm_json(
             prompt,
+            base_url,
             api_key,
             model,
             SECTION_RESPONSE_SCHEMA,
@@ -852,10 +901,11 @@ def make_question_node(spec: QuestionSpec):
 
 def final_scoring_node(state: EvaluationState) -> EvaluationState:
     prompt = build_final_prompt(state["stock"], state.get("section_analyses", {}))
-    api_key, model = gemini_settings()
+    base_url, api_key, model = litellm_settings()
     try:
-        parsed, raw_text, citations, raw_payload = gemini_json(
+        parsed, raw_text, citations, raw_payload = litellm_json(
             prompt,
+            base_url,
             api_key,
             model,
             EVALUATION_RESPONSE_SCHEMA,
@@ -925,12 +975,14 @@ def run_evaluation_graph(stock: dict[str, Any]) -> dict[str, Any]:
     return final_state["result"]
 
 
-def evaluate_stock(stock: dict[str, Any], api_key: str | None = None, model: str | None = None) -> dict[str, Any]:
+def evaluate_stock(stock: dict[str, Any], api_key: str | None = None, model: str | None = None, base_url: str | None = None) -> dict[str, Any]:
     load_env()
     if api_key:
-        os.environ["GEMINI_API_KEY"] = api_key
+        os.environ["LITELLM_API_KEY"] = api_key
     if model:
-        os.environ["GEMINI_MODEL"] = model
+        os.environ["LITELLM_MODEL"] = model
+    if base_url:
+        os.environ["LITELLM_BASE_URL"] = base_url
     cached = current_evaluation(str(stock["stock_id"]))
     if cached:
         return cached
@@ -1057,7 +1109,7 @@ def answer_document_question(
     raw_traced_chunks = qa_trace_chunks(raw_source_map)
     rejected_traced_chunks = qa_trace_chunks(rejected_source_map)
 
-    # Stop before Gemini when retrieval found nothing above the relevance gate.
+    # Stop before LLM when retrieval found nothing above the relevance gate.
     # This saves a model call and prevents answers built from unrelated context.
     if not chunks:
         answer = (
@@ -1130,11 +1182,12 @@ def answer_document_question(
 
     context, source_map = format_document_qa_context(chunks)
     prompt = build_document_qa_prompt(stock, question, context, inferred_filters)
-    api_key, model = gemini_settings()
+    base_url, api_key, model = litellm_settings()
     traced_chunks = qa_trace_chunks(source_map)
     try:
-        parsed, raw_text, _citations, raw_payload = gemini_json(
+        parsed, raw_text, _citations, raw_payload = litellm_json(
             prompt,
+            base_url,
             api_key,
             model,
             DOCUMENT_QA_RESPONSE_SCHEMA,

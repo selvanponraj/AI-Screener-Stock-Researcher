@@ -322,8 +322,8 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
 
     details = {
         "pe_vs_industry": (
-            f"Stock PE {fmt_number(stock_pe)} <= 1.25 * Industry PE "
-            f"{fmt_number(industry_pe)} = {fmt_number(industry_pe * 1.25 if industry_pe is not None else None)}"
+            f"Stock PE {fmt_number(stock_pe)} <= 1.1 * Industry PE "
+            f"{fmt_number(industry_pe)} = {fmt_number(industry_pe * 1.1 if industry_pe is not None else None)}"
         ),
         "pe_vs_historical": (
             f"Stock PE {fmt_number(stock_pe)} vs historical PE {historical or 'missing'}; "
@@ -359,12 +359,35 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
             f"decrease {fmt_percent(numeric(html_row, 'promoter_decrease'))}, threshold < 5%"
         ),
         "peg_ratio_under_1_5": (
-            f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
-            f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
-            f"Effective CAGR {fmt_percent(numeric(html_row, 'effective_cagr'))}, "
-            f"PEG {fmt_number(numeric(html_row, 'peg_ratio'))}; threshold <= 1.5"
-            if numeric(html_row, 'stock_pe') is not None or numeric(html_row, 'profit_growth_3_years') is not None
-            else "PEG evaluation data missing or fail guardrail (3Y/5Y growth > 0 and 3Y >= 75% of 5Y); threshold <= 1.5"
+            (
+                f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
+                f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
+                f"Data missing; threshold <= 1.5"
+            )
+            if numeric(html_row, "stock_pe") is None or numeric(html_row, "profit_growth_3_years") is None or numeric(html_row, "profit_growth_5_years") is None
+            else (
+                (
+                    f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
+                    f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
+                    f"Fail: non-positive profit growth; threshold <= 1.5"
+                )
+                if (numeric(html_row, "profit_growth_3_years") or 0) <= 0 or (numeric(html_row, "profit_growth_5_years") or 0) <= 0
+                else (
+                    (
+                        f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
+                        f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
+                        f"Effective CAGR {fmt_percent(numeric(html_row, 'effective_cagr'))}, Raw PEG {fmt_number(numeric(html_row, 'peg_ratio'))}; "
+                        f"Fail: 3Y growth ({fmt_percent(numeric(html_row, 'profit_growth_3_years'))}) < 75% of 5Y growth ({fmt_percent((numeric(html_row, 'profit_growth_5_years') or 0) * 0.75)}); threshold <= 1.5"
+                    )
+                    if (numeric(html_row, "profit_growth_3_years") or 0) < 0.75 * (numeric(html_row, "profit_growth_5_years") or 0)
+                    else (
+                        f"Stock PE {fmt_number(numeric(html_row, 'stock_pe'))}, "
+                        f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))}; "
+                        f"Effective CAGR {fmt_percent(numeric(html_row, 'effective_cagr'))}, "
+                        f"PEG {fmt_number(numeric(html_row, 'peg_ratio'))}; threshold <= 1.5"
+                    )
+                )
+            )
         ),
         "revenue_quality_guard": (
             f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
@@ -405,49 +428,60 @@ def build_rule_details(html_row: dict[str, str], excel_row: dict[str, str]) -> l
 
 def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = None) -> list[dict[str, object]]:
     pct = pass_percentage if pass_percentage is not None else FINAL_RULE_PASS_PERCENTAGE
-    threshold = math.ceil(TOTAL_RULES * pct / 100)
     html_csv = paths.html_analysis_dir / "company_rule_results.csv"
+    if not html_csv.is_file():
+        return []
+
     excel_csv = paths.excel_analysis_dir / "excel_rule_results.csv"
-    if not html_csv.is_file() or not excel_csv.is_file():
-        raise FileNotFoundError("Expected both HTML-rule and Excel-rule CSV outputs.")
+    excel_by_url: dict[str, dict[str, str]] = {}
+    if excel_csv.is_file():
+        with excel_csv.open(newline="", encoding="utf-8") as csv_file:
+            for row in csv.DictReader(csv_file):
+                url = row.get("company_url", "").rstrip("/")
+                if url:
+                    excel_by_url[url] = row
 
     with html_csv.open(newline="", encoding="utf-8") as csv_file:
-        html_rows = {row["company_url"]: row for row in csv.DictReader(csv_file)}
-    with excel_csv.open(newline="", encoding="utf-8") as csv_file:
-        excel_rows = list(csv.DictReader(csv_file))
+        html_rows = list(csv.DictReader(csv_file))
 
     combined: list[dict[str, object]] = []
-    for excel_row in excel_rows:
-        html_row = html_rows.get(excel_row["company_url"])
-        if not html_row:
-            continue
+    for html_row in html_rows:
+        company_url = html_row.get("company_url", "")
+        clean_url = company_url.rstrip("/")
+        excel_row = excel_by_url.get(clean_url, {})
+
         first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
         excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
         total_passes = first_passes + excel_passes
-        # Quantitative rules contribute exactly half of the final 100-point score.
-        rule_score = round((total_passes / TOTAL_RULES) * 50, 2)
+
+        has_excel = bool(excel_row)
+        total_rule_count = TOTAL_RULES if has_excel else len(FIRST_STAGE_RULE_COLUMNS)
+        pass_pct = round((total_passes / total_rule_count) * 100, 2)
+        rule_score = round((total_passes / total_rule_count) * 50, 2)
+        passes_filter = pass_pct >= pct
+
         combined.append(
             {
-                "stock_id": stock_id(html_row["company_name"], html_row["company_url"]),
-                "company_name": html_row["company_name"],
-                "company_url": html_row["company_url"],
-                "html_file": html_row["html_file"],
-                "excel_file": excel_row["excel_file"],
+                "stock_id": stock_id(html_row.get("company_name", ""), company_url),
+                "company_name": html_row.get("company_name", ""),
+                "company_url": company_url,
+                "html_file": html_row.get("html_file", ""),
+                "excel_file": excel_row.get("excel_file", ""),
                 "market_categories": html_row.get("market_categories", ""),
                 "first_11_pass_count": first_passes,
                 "excel_rule_pass_count": excel_passes,
                 "total_rule_pass_count": total_passes,
-                "total_rule_count": TOTAL_RULES,
-                "rule_pass_percentage": round((total_passes / TOTAL_RULES) * 100, 2),
+                "total_rule_count": total_rule_count,
+                "rule_pass_percentage": pass_pct,
                 "rule_score_out_of_50": rule_score,
-                "passes_final_rule_filter": total_passes >= threshold,
-                **{column: html_row.get(column, "") for column in FIRST_STAGE_RULE_COLUMNS},
-                **{column: excel_row.get(column, "") for column in EXCEL_RULE_COLUMNS},
+                "passes_final_rule_filter": passes_filter,
+                **html_row,
+                **excel_row,
                 "rule_details": build_rule_details(html_row, excel_row),
             }
         )
 
-    combined.sort(key=lambda row: (-int(row["total_rule_pass_count"]), str(row["company_name"])))
+    combined.sort(key=lambda row: (-float(row["rule_pass_percentage"]), str(row["company_name"])))
     paths.final_dir.mkdir(parents=True, exist_ok=True)
     json_path = paths.final_dir / "rule_filtered_stocks.json"
     csv_path = paths.final_dir / "rule_filtered_stocks.csv"
@@ -461,6 +495,7 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
     else:
         csv_path.write_text("", encoding="utf-8")
     return filtered
+
 
 
 def read_json_list(path: Path) -> list[dict[str, object]]:
@@ -649,6 +684,59 @@ def load_current_rule_filtered() -> list[dict[str, object]]:
             {**excel_row, **{column: str(row.get(column, "")) for column in EXCEL_RULE_COLUMNS}},
         )
     return rows
+
+
+def load_all_current_run_stocks(pass_percentage: float = 100.0) -> list[dict[str, object]]:
+    paths = current_paths()
+    html_csv = paths.html_analysis_dir / "company_rule_results.csv"
+    if not html_csv.is_file():
+        return []
+
+    excel_csv = paths.excel_analysis_dir / "excel_rule_results.csv"
+    excel_by_url: dict[str, dict[str, str]] = {}
+    if excel_csv.is_file():
+        with excel_csv.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                url = row.get("company_url", "").rstrip("/")
+                if url:
+                    excel_by_url[url] = row
+
+    results: list[dict[str, object]] = []
+    with html_csv.open(newline="", encoding="utf-8") as f:
+        for html_row in csv.DictReader(f):
+            company_url = html_row.get("company_url", "")
+            clean_url = company_url.rstrip("/")
+            excel_row = excel_by_url.get(clean_url, {})
+
+            first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
+            excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
+            total_passes = first_passes + excel_passes
+
+            has_excel = bool(excel_row)
+            total_rule_count = TOTAL_RULES if has_excel else len(FIRST_STAGE_RULE_COLUMNS)
+            pass_pct = round((total_passes / total_rule_count) * 100, 2)
+            rule_score = round((total_passes / total_rule_count) * 50, 2)
+            passes_filter = pass_pct >= pass_percentage
+
+            s_id = stock_id(html_row.get("company_name", ""), company_url)
+            stock_data: dict[str, object] = {
+                "stock_id": s_id,
+                "company_name": html_row.get("company_name", ""),
+                "company_url": company_url,
+                "first_11_pass_count": first_passes,
+                "excel_rule_pass_count": excel_passes,
+                "total_rule_pass_count": total_passes,
+                "total_rule_count": total_rule_count,
+                "rule_pass_percentage": pass_pct,
+                "rule_score_out_of_50": rule_score,
+                "passes_final_rule_filter": passes_filter,
+                "stock_source": "current_run",
+                **html_row,
+                **excel_row,
+                "rule_details": build_rule_details(html_row, excel_row),
+            }
+            results.append(stock_data)
+    return results
 
 
 CUSTOM_STOCKS_DIR = PROJECT_ROOT / "data" / "custom_stocks"

@@ -22,30 +22,36 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
 
-def load_visible_stocks() -> list[dict[str, Any]]:
-    # Keep batch rule-filtered, custom single-stock, and document-library stocks visible.
+def load_visible_stocks(pass_percentage: float = 90.0) -> list[dict[str, Any]]:
+    # Load batch screener stocks for current run, custom single stocks, and document store stocks.
     stocks_by_id: dict[str, dict[str, Any]] = {}
-    for stock in rules_pipeline.load_current_rule_filtered():
+    
+    # 1. Load batch screener stocks for current run
+    for stock in rules_pipeline.load_all_current_run_stocks(pass_percentage=pass_percentage):
         stock_id = str(stock["stock_id"])
-        stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
+        stocks_by_id[stock_id] = {**stock, "stock_source": "current_run"}
 
+    # 2. Load custom single stocks under custom keys so they don't overwrite current_run batch filter entries
     for stock in rules_pipeline.load_custom_stocks():
         stock_id = str(stock["stock_id"])
-        if stock_id not in stocks_by_id:
-            stocks_by_id[stock_id] = {**stock, "stock_source": "rule_filtered"}
+        key = f"custom_{stock_id}" if stock_id in stocks_by_id else stock_id
+        stocks_by_id[key] = {**stock, "stock_source": "custom_single_stock"}
 
+    # 3. Document store stocks
     for stock in document_store.stocks_with_documents():
         stock_id = str(stock["stock_id"])
-        if stock_id not in stocks_by_id:
+        if stock_id not in stocks_by_id and f"custom_{stock_id}" not in stocks_by_id:
             stocks_by_id[stock_id] = dict(stock)
 
     return sorted(
         stocks_by_id.values(),
         key=lambda stock: (
-            0 if stock.get("stock_source") == "rule_filtered" else 1,
+            0 if stock.get("stock_source") == "current_run" else 1,
+            -float(stock.get("rule_pass_percentage") or 0),
             str(stock.get("company_name", "")).lower(),
         ),
     )
+
 
 
 class AppState:
@@ -56,7 +62,7 @@ class AppState:
         self.phase = "idle"
         self.logs: list[str] = []
         self.pass_percentage = 90.0
-        self.stocks: list[dict[str, Any]] = load_visible_stocks()
+        self.stocks: list[dict[str, Any]] = load_visible_stocks(self.pass_percentage)
         self.error: str | None = None
         self.error_trace: str | None = None
         self.progress_current = 0
@@ -72,9 +78,10 @@ class AppState:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             if not self.running:
-                disk_stocks = load_visible_stocks()
+                disk_stocks = load_visible_stocks(self.pass_percentage)
                 if disk_stocks:
                     self.stocks = disk_stocks
+
                 steps = rules_pipeline.pipeline_status(pass_percentage=self.pass_percentage)
                 if self.error and failed_step_is_now_complete(self.error, steps):
                     self.error = None
@@ -155,7 +162,7 @@ def run_pipeline_background() -> None:
         pass_pct = STATE.pass_percentage
         stocks = rules_pipeline.run_full_pipeline(STATE.log, progress=STATE.progress, pass_percentage=pass_pct)
         with STATE.lock:
-            STATE.stocks = load_visible_stocks()
+            STATE.stocks = load_visible_stocks(STATE.pass_percentage)
             STATE.phase = "pipeline complete"
             STATE.current_step = "Upload documents for filtered stocks"
     except Exception as exc:
@@ -186,11 +193,12 @@ def run_step_background(step_id: str) -> None:
         stocks = rules_pipeline.run_step(step_id, STATE.log, progress=STATE.progress, pass_percentage=pass_pct)
         with STATE.lock:
             if stocks:
-                STATE.stocks = load_visible_stocks()
+                STATE.stocks = load_visible_stocks(STATE.pass_percentage)
             else:
-                STATE.stocks = load_visible_stocks()
+                STATE.stocks = load_visible_stocks(STATE.pass_percentage)
             STATE.phase = f"step complete: {step_id}"
             STATE.current_step = "Step complete"
+
     except Exception as exc:
         trace = traceback.format_exc()
         STATE.log(trace)
@@ -215,7 +223,8 @@ def evaluate_background(stock_id: str | None) -> None:
         selected = [
             stock
             for stock in stocks
-            if (not stock_id or stock["stock_id"] == stock_id) and stock.get("stock_source") == "rule_filtered"
+            if (not stock_id or stock.get("stock_id") == stock_id or stock_id == f"custom_{stock.get('stock_id')}")
+            and stock.get("stock_source") in {"rule_filtered", "current_run", "custom_single_stock"}
         ]
         if not selected:
             STATE.log("No rule-filtered stocks selected for AI evaluation.")
@@ -274,6 +283,8 @@ class Handler(BaseHTTPRequestHandler):
             self.set_threshold()
         elif parsed.path == "/api/analyze-ticker":
             self.analyze_ticker()
+        elif parsed.path == "/api/refresh-stock":
+            self.refresh_stock()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -298,9 +309,9 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.logs = []
                 STATE.current_step = f"Analyzing {ticker}"
             try:
-                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=True)
+                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=False)
                 with STATE.lock:
-                    STATE.stocks = load_visible_stocks()
+                    STATE.stocks = load_visible_stocks(STATE.pass_percentage)
                     STATE.phase = f"single stock complete: {stock_data.get('company_name', ticker)}"
                     STATE.current_step = "Analysis complete"
             except Exception as exc:
@@ -319,6 +330,50 @@ class Handler(BaseHTTPRequestHandler):
         thread.start()
         self.send_json({"ok": True})
 
+    def refresh_stock(self) -> None:
+        with STATE.lock:
+            if STATE.running:
+                self.send_json({"ok": False, "error": "A job is already running."}, status=409)
+                return
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        ticker = payload.get("ticker", "").strip() or payload.get("stock_id", "").strip()
+        if not ticker:
+            self.send_json({"ok": False, "error": "Ticker input cannot be empty."}, status=400)
+            return
+
+        def run_refresh_bg() -> None:
+            with STATE.lock:
+                STATE.running = True
+                STATE.phase = f"refreshing stock: {ticker}"
+                STATE.error = None
+                STATE.error_trace = None
+                STATE.logs = []
+                STATE.current_step = f"Re-downloading & analyzing {ticker}"
+            try:
+                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=True)
+                with STATE.lock:
+                    STATE.stocks = load_visible_stocks(STATE.pass_percentage)
+                    STATE.phase = f"refresh complete: {stock_data.get('company_name', ticker)}"
+                    STATE.current_step = "Refresh complete"
+
+            except Exception as exc:
+                trace = traceback.format_exc()
+                STATE.log(trace)
+                with STATE.lock:
+                    STATE.error = str(exc)
+                    STATE.error_trace = trace
+                    STATE.phase = "refresh failed"
+                    STATE.current_step = "Refresh failed"
+            finally:
+                with STATE.lock:
+                    STATE.running = False
+
+        thread = threading.Thread(target=run_refresh_bg, daemon=True)
+        thread.start()
+        self.send_json({"ok": True})
+
+
     def set_threshold(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
@@ -326,10 +381,11 @@ class Handler(BaseHTTPRequestHandler):
         with STATE.lock:
             STATE.pass_percentage = pct
             paths = rules_pipeline.current_paths()
-            if (paths.html_analysis_dir / "company_rule_results.csv").is_file() and (paths.excel_analysis_dir / "excel_rule_results.csv").is_file():
+            if (paths.html_analysis_dir / "company_rule_results.csv").is_file():
                 rules_pipeline.combine_rule_outputs(paths, pass_percentage=pct)
-                STATE.stocks = load_visible_stocks()
+            STATE.stocks = load_visible_stocks(pct)
         self.send_json({"ok": True, "pass_percentage": pct})
+
 
     def start_pipeline(self) -> None:
         with STATE.lock:
@@ -450,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "stock_id and question are required."}, status=400)
                 return
             with STATE.lock:
-                stocks = list(STATE.stocks) or load_visible_stocks()
+                stocks = list(STATE.stocks) or load_visible_stocks(STATE.pass_percentage)
             stock = next((item for item in stocks if str(item.get("stock_id")) == stock_id), None)
             if not stock:
                 self.send_json({"ok": False, "error": f"Unknown stock: {stock_id}"}, status=404)
@@ -469,20 +525,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc), "trace": trace}, status=500)
 
     def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def send_html(self, html: str) -> None:
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args)
@@ -994,8 +1057,8 @@ INDEX_HTML = r"""
       <label style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
         Show:
         <select id="viewFilterSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
+          <option value="batch">Batch Screener Stocks</option>
           <option value="single">Single Stocks Only</option>
-          <option value="batch">Batch Screener Stocks Only</option>
         </select>
       </label>
       <label id="thresholdLabel" style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
@@ -1017,7 +1080,7 @@ INDEX_HTML = r"""
   <main>
     <aside>
       <div class="status">
-        Gemini credentials are read from <strong>.env</strong>.
+        LiteLLM credentials are read from <strong>.env</strong>.
       </div>
       <label>Pipeline Steps</label>
       <div id="steps" class="step-list"></div>
@@ -1075,9 +1138,9 @@ INDEX_HTML = r"""
       $('progressFill').style.width = `${latest.progress_percent || 0}%`;
       $('progressText').textContent = `${latest.progress_percent || 0}% (${latest.progress_current || 0}/${latest.progress_total || 1})`;
       $('running').textContent = latest.running;
-      const ruleFilteredCount = latest.stocks.filter(stock => stock.stock_source === 'rule_filtered').length;
+      const ruleFilteredCount = latest.stocks.filter(stock => stock.stock_source === 'rule_filtered' || stock.stock_source === 'current_run' || stock.stock_source === 'custom_single_stock' || stock.passes_final_rule_filter).length;
       const documentOnlyCount = latest.stocks.length - ruleFilteredCount;
-      $('count').textContent = `${latest.stocks.length} (${ruleFilteredCount} filtered, ${documentOnlyCount} document library)`;
+      $('count').textContent = `${latest.stocks.length} (${ruleFilteredCount} passing, ${documentOnlyCount} other)`;
       $('error').textContent = latest.error || '';
       $('errorBox').style.display = latest.error ? 'block' : 'none';
       $('errorBox').textContent = latest.error_trace || latest.error || '';
@@ -1136,7 +1199,7 @@ INDEX_HTML = r"""
         Array.from(document.querySelectorAll('details.qa-trace[open]'))
           .map(detail => detail.dataset.stock)
       );
-      const viewMode = ($('viewFilterSelect') && $('viewFilterSelect').value) || 'single';
+      const viewMode = ($('viewFilterSelect') && $('viewFilterSelect').value) || 'batch';
       if ($('thresholdSelect') && $('thresholdNaBadge')) {
         if (viewMode === 'single') {
           $('thresholdSelect').style.display = 'none';
@@ -1147,45 +1210,57 @@ INDEX_HTML = r"""
         }
       }
       const visibleStocks = stocks.filter(stock => {
-        if (viewMode === 'single') {
-          if (!stock.is_custom_single_stock) return false;
-          if (!activeSingleTicker) return false;
+        if (activeSingleTicker) {
           const search = activeSingleTicker.toLowerCase();
           return stock.company_name.toLowerCase().includes(search) || 
-                 stock.company_url.toLowerCase().includes(`/${search}/`) ||
+                 (stock.company_url && stock.company_url.toLowerCase().includes(search)) ||
                  stock.stock_id.toLowerCase().includes(search);
         }
-        return !stock.is_custom_single_stock;
+        if (viewMode === 'single') {
+          return stock.stock_source === 'custom_single_stock' || stock.is_custom_single_stock;
+        }
+        if (viewMode === 'batch') {
+          return stock.stock_source === 'current_run' && Boolean(stock.passes_final_rule_filter);
+        }
+
+        return true;
       });
+
+
       body.innerHTML = '';
-      $('uploadPrompt').textContent = viewMode === 'single'
-        ? (activeSingleTicker
-            ? `Single stock mode active (Pass Threshold: N/A). Showing analyzed results for "${activeSingleTicker}".`
-            : `Enter a stock ticker (e.g. TCS) in the input box above and click "Analyze Ticker".`)
+      $('uploadPrompt').textContent = activeSingleTicker
+        ? `Showing ${visibleStocks.length} matching result(s) for "${activeSingleTicker}".`
         : (visibleStocks.length
-          ? `Upload reports or concalls for filtered stocks and document-library stocks. Duplicate files are skipped automatically.`
+          ? `Displaying ${visibleStocks.length} analyzed stocks. Click 🔄 Refresh to force re-downloading reports & Excel for any stock.`
           : 'Run single stock analysis or Screener pipeline to view stocks.');
       for (const stock of visibleStocks) {
         const tr = document.createElement('tr');
         const docs = stock.documents || [];
         const ai = stock.ai_evaluation || {};
         const rules = stock.rule_details || ruleDetailsFromStock(stock);
-        const isRuleFiltered = stock.stock_source === 'rule_filtered';
+        const isRuleFiltered = stock.stock_source === 'rule_filtered' || stock.stock_source === 'current_run' || stock.stock_source === 'custom_single_stock' || stock.total_rule_count > 0;
+        const sourceLabel = stock.stock_source === 'custom_single_stock' || stock.is_custom_single_stock
+          ? 'Custom Stock'
+          : (stock.stock_source === 'current_run' ? 'Current Run' : (stock.stock_source === 'rule_filtered' ? 'Rule filtered' : 'Document library'));
         const reasons = ai.key_reasons || [];
         const isEvaluating = evaluatingStockId && evaluatingStockId === stock.stock_id && latest.running;
         const sectionBreakdown = renderSectionBreakdown(ai.section_analyses || {});
         tr.innerHTML = `
           <td>
-            <div class="stock-name">${escapeHtml(stock.company_name)}</div>
+            <div style="display: inline-flex; align-items: center; gap: 6px;">
+              <span class="stock-name" style="font-weight: 600;">${escapeHtml(stock.company_name)}</span>
+              <button class="secondary btn-sm refresh-one" style="padding: 1px 5px; font-size: 0.85rem; line-height: 1; border-radius: 4px; cursor: pointer;" data-stock="${escapeAttr(stock.stock_id)}" data-name="${escapeAttr(stock.company_name)}" title="Re-download HTML, Excel & Reports for ${escapeAttr(stock.company_name)}">🔄</button>
+            </div>
             <div class="muted">${escapeHtml(stock.market_categories || '')}</div>
+
             <div class="muted">${escapeHtml(stock.company_url || '')}</div>
-            <div class="muted">${stock.is_custom_single_stock ? 'Single stock' : (isRuleFiltered ? 'Rule filtered' : 'Document library')}</div>
+            <div class="muted"><span class="badge" style="font-size: 0.75rem; font-weight: normal;">${sourceLabel}</span></div>
           </td>
           <td>
             ${isRuleFiltered ? `
-              <span class="badge">${stock.total_rule_pass_count}/${stock.total_rule_count}</span>
-              <div class="muted">${stock.rule_pass_percentage}% passed</div>
-              <div class="muted">Rule score: ${stock.rule_score_out_of_50}/50</div>
+              <span class="badge">${stock.total_rule_pass_count ?? 0}/${stock.total_rule_count ?? 14}</span>
+              <div class="muted">${stock.rule_pass_percentage ?? 0}% passed</div>
+              <div class="muted">Rule score: ${stock.rule_score_out_of_50 ?? 0}/50</div>
             ` : `
               <span class="badge">Documents</span>
               <div class="muted">No current rule-filter output for this stock.</div>
@@ -1222,8 +1297,8 @@ INDEX_HTML = r"""
                 <div class="inline-progress"><div class="inline-progress-fill"></div></div>
                 <div class="muted">${escapeHtml(latest.current_step || 'Running AI evaluation')}</div>
               ` : `
-                ${ai.total_score_out_of_100 !== undefined ? `<span class="badge">${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
-                <div class="muted">AI: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
+                ${ai.total_score_out_of_100 !== undefined ? `<span class="badge" title="Total Combined Score (Rule Score + AI Score)">Total: ${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
+                <div class="muted">AI score: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
                 <button class="secondary eval-one" data-stock="${stock.stock_id}">Evaluate</button>
               `}
             ` : '<span class="muted">Document Q&A only</span>'}
@@ -1254,7 +1329,35 @@ INDEX_HTML = r"""
       document.querySelectorAll('.eval-one').forEach(btn => {
         btn.addEventListener('click', () => evaluate(btn.dataset.stock));
       });
+      document.querySelectorAll('.refresh-one').forEach(btn => {
+        btn.addEventListener('click', () => refreshStock(btn.dataset.stock, btn.dataset.name));
+      });
     }
+
+    async function refreshStock(stockId, companyName) {
+      if (latest && latest.running) {
+        alert("A job is currently running. Please wait for it to complete.");
+        return;
+      }
+      if (!confirm(`Re-download latest HTML profile, Excel export, and BSE reports for ${companyName || stockId}?`)) {
+        return;
+      }
+      try {
+        const res = await api('/api/refresh-stock', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ticker: stockId })
+        });
+        if (!res.ok) {
+          alert("Error initiating refresh: " + (res.error || "Unknown error"));
+        } else {
+          await refresh();
+        }
+      } catch (err) {
+        alert("Network error while starting stock refresh.");
+      }
+    }
+
 
     function stockFormInteractionActive() {
       // Do not let background polling erase typed questions, selected files, or open traces.
@@ -1516,7 +1619,7 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
       <pre class="trace-pre">${escapeHtml(JSON.stringify(trace.inferred_filters || {}, null, 2))}</pre>
     </div>
     <div class="trace-card">
-      <strong>Accepted Chunks Sent To Gemini</strong>
+      <strong>Accepted Chunks Sent To LiteLLM</strong>
       ${chunks.length ? chunks.map(renderTraceChunk).join('') : '<div class="muted">No chunks retrieved.</div>'}
     </div>
     <div class="trace-card">
@@ -1524,7 +1627,7 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
       ${rejectedChunks.length ? rejectedChunks.map(renderTraceChunk).join('') : '<div class="muted">No chunks rejected.</div>'}
     </div>
     <div class="trace-card">
-      <strong>Prompt Sent To Gemini</strong>
+      <strong>Prompt Sent To LiteLLM</strong>
       <pre class="trace-pre">${escapeHtml(trace.prompt || '')}</pre>
     </div>
     <div class="trace-card">
@@ -1595,9 +1698,7 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     });
     $('tickerInput').addEventListener('input', (e) => {
       activeSingleTicker = e.target.value.trim();
-      if ($('viewFilterSelect') && $('viewFilterSelect').value === 'single') {
-        renderStocks(latest.stocks || []);
-      }
+      renderStocks(latest.stocks || []);
     });
     $('runBtn').addEventListener('click', async () => {
       await api('/api/run', { method: 'POST' });
@@ -1606,8 +1707,13 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     $('refreshBtn').addEventListener('click', refresh);
     $('evalAllBtn').addEventListener('click', () => evaluate(''));
     $('viewFilterSelect').addEventListener('change', () => {
+      if ($('viewFilterSelect').value !== 'single') {
+        activeSingleTicker = '';
+        if ($('tickerInput')) $('tickerInput').value = '';
+      }
       renderStocks(latest.stocks || []);
     });
+
     $('thresholdSelect').addEventListener('change', async (e) => {
       const val = parseFloat(e.target.value);
       await api('/api/set-threshold', {

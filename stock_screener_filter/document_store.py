@@ -322,12 +322,22 @@ def embedding_model() -> object:
         raise RuntimeError("sentence-transformers is not installed. Run: python -m pip install -r requirements.txt") from exc
 
     device = os.environ.get("EMBEDDING_DEVICE") or None
-    return SentenceTransformer(
-        DEFAULT_EMBEDDING_MODEL,
-        cache_folder=str(MODEL_CACHE_DIR),
-        device=device,
-        local_files_only=local_files_only,
-    )
+    try:
+        return SentenceTransformer(
+            DEFAULT_EMBEDDING_MODEL,
+            cache_folder=str(MODEL_CACHE_DIR),
+            device=device,
+            local_files_only=local_files_only,
+        )
+    except Exception:
+        if local_files_only and configured_local_only is None:
+            return SentenceTransformer(
+                DEFAULT_EMBEDDING_MODEL,
+                cache_folder=str(MODEL_CACHE_DIR),
+                device=device,
+                local_files_only=False,
+            )
+        raise
 
 
 def embeddings(texts: list[str]) -> list[list[float]]:
