@@ -66,11 +66,31 @@ def all_present(*values: Optional[float]) -> bool:
 
 def quick_ratios(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     ratios: dict[str, Optional[float]] = {}
-    for item in soup.select("li"):
-        name = item.select_one("span.name")
-        value = item.select_one("span.value span.number")
+    for item in soup.select("li, div.ratio-item, tr"):
+        name = item.select_one("span.name, span.title, td.name, span.label")
+        value = item.select_one("span.value span.number, span.number, td.number, span.value")
         if name and value:
-            ratios[clean_text(name)] = parse_number(value)
+            clean_name = clean_text(name)
+            parsed_val = parse_number(value)
+            ratios[clean_name] = parsed_val
+
+    if "Market Cap" not in ratios or ratios["Market Cap"] is None:
+        for k, v in ratios.items():
+            if "market cap" in k.lower() and v is not None:
+                ratios["Market Cap"] = v
+                break
+
+    if "Market Cap" not in ratios or ratios["Market Cap"] is None:
+        for el in soup.find_all(text=re.compile(r"Market\s+Cap", re.I)):
+            container = el.find_parent(["li", "div", "tr"]) or el.parent
+            if container:
+                numbers = re.findall(r"[\d,]+(?:\.\d+)?", container.get_text())
+                if numbers:
+                    val = parse_number(numbers[0])
+                    if val is not None and val > 0:
+                        ratios["Market Cap"] = val
+                        break
+
     return ratios
 
 
@@ -80,33 +100,33 @@ def ranges_table(soup: BeautifulSoup, heading: str) -> dict[str, Optional[float]
         if clean_text(title) != heading:
             continue
 
-        values: dict[str, Optional[float]] = {}
+        ratios: dict[str, Optional[float]] = {}
         for row in table.select("tr"):
-            cells = row.find_all("td")
+            cells = row.select("td")
             if len(cells) == 2:
-                values[clean_text(cells[0]).rstrip(":")] = parse_number(cells[1])
-        return values
+                ratios[clean_text(cells[0]).rstrip(":")] = parse_number(cells[1])
+        return ratios
     return {}
 
 
 def sales_history(soup: BeautifulSoup) -> list[tuple[str, float]]:
-    section = soup.select_one("section#profit-loss")
+    section = soup.find("section", id="profit-loss")
     if not section:
         return []
 
-    table = section.select_one("table.data-table")
-    if not table:
+    headers_row = section.find("thead")
+    if not headers_row:
         return []
 
-    headers = [clean_text(header) for header in table.select("thead th[data-date-key]")]
-    sales_row = next(
-        (
-            row
-            for row in table.select("tbody tr")
-            if clean_text(row.select_one("td.text")).startswith("Sales")
-        ),
-        None,
-    )
+    headers = [clean_text(th) for th in headers_row.find_all("th")[1:]]
+
+    sales_row = None
+    for tr in section.select("tbody tr"):
+        title = clean_text(tr.find("td"))
+        if title.lower().startswith("sales") or title.lower().rstrip(" +") == "sales":
+            sales_row = tr
+            break
+
     if not sales_row:
         return []
 
@@ -118,7 +138,7 @@ def sales_history(soup: BeautifulSoup) -> list[tuple[str, float]]:
     ]
 
 
-def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
+def sales_growth_rule(soup: BeautifulSoup, market_cap: float | None = None) -> dict[str, Any]:
     history = sales_history(soup)
     recent_history = history[-11:]
     growth_rates: list[float] = []
@@ -130,10 +150,29 @@ def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
     sales_3y = compounded_sales.get("3 Years")
     sales_5y = compounded_sales.get("5 Years")
 
-    if not growth_rates:
+    if market_cap is not None and market_cap > 50000:
+        category = "Large-Cap"
+        min_sales_cagr = 10.0
+        min_yoy_growth = 10.0
+    elif market_cap is not None and market_cap >= 10000:
+        category = "Mid-Cap"
+        min_sales_cagr = 12.0
+        min_yoy_growth = 10.0
+    else:
+        category = "Small-Cap"
+        min_sales_cagr = 15.0
+        min_yoy_growth = 12.0
+
+    min_hit_rate = 60.0
+
+    if len(growth_rates) < 3:
         return {
             "status": "missing",
-            "observations": 0,
+            "market_category": category,
+            "min_sales_cagr": min_sales_cagr,
+            "min_yoy_growth": min_yoy_growth,
+            "min_hit_rate": min_hit_rate,
+            "observations": len(growth_rates),
             "over_10_count": 0,
             "over_10_percentage": None,
             "sales_3y": sales_3y,
@@ -141,17 +180,27 @@ def sales_growth_rule(soup: BeautifulSoup) -> dict[str, Any]:
             "rates": growth_rates,
         }
 
-    over_10_count = sum(rate >= 10 for rate in growth_rates)
-    over_10_percentage = over_10_count / len(growth_rates) * 100
+    over_floor_count = sum(rate >= min_yoy_growth for rate in growth_rates)
+    over_floor_percentage = over_floor_count / len(growth_rates) * 100
 
-    compounded_pass = all_present(sales_3y, sales_5y) and sales_3y >= 12.0 and sales_5y >= 12.0
-    yoy_pass = over_10_percentage >= 70.0
+    if sales_3y is not None and sales_5y is not None:
+        compounded_pass = sales_3y >= min_sales_cagr and sales_5y >= min_sales_cagr
+    elif sales_3y is not None:
+        compounded_pass = sales_3y >= min_sales_cagr
+    else:
+        compounded_pass = False
+
+    yoy_pass = over_floor_percentage >= min_hit_rate
 
     return {
         "status": status(compounded_pass and yoy_pass),
+        "market_category": category,
+        "min_sales_cagr": min_sales_cagr,
+        "min_yoy_growth": min_yoy_growth,
+        "min_hit_rate": min_hit_rate,
         "observations": len(growth_rates),
-        "over_10_count": over_10_count,
-        "over_10_percentage": over_10_percentage,
+        "over_10_count": over_floor_count,
+        "over_10_percentage": over_floor_percentage,
         "sales_3y": sales_3y,
         "sales_5y": sales_5y,
         "compounded_pass": compounded_pass,
@@ -292,8 +341,20 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
     sales_5y = compounded_sales.get("5 Years")
 
     rev_quality_pass: bool | None = None
-    if all_present(profit_3y, profit_5y, sales_3y, sales_5y):
-        rev_quality_pass = (profit_3y >= sales_3y) and (profit_5y >= sales_5y)
+    pass_3y = (profit_3y >= sales_3y) if all_present(profit_3y, sales_3y) else None
+    pass_5y = (profit_5y >= sales_5y) if all_present(profit_5y, sales_5y) else None
+    if pass_3y is True or pass_5y is True:
+        rev_quality_pass = True
+    elif pass_3y is False and pass_5y is False:
+        rev_quality_pass = False
+    elif pass_3y is not None:
+        rev_quality_pass = pass_3y
+    elif pass_5y is not None:
+        rev_quality_pass = pass_5y
+
+    market_cap = ratios.get("Market Cap")
+    sales = sales_growth_rule(soup, market_cap)
+    promoter = promoter_holding_rule(soup)
 
     rule_statuses = {
         "pe_vs_industry": status(
@@ -312,24 +373,23 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
             if ratios.get("Pledged percentage") is not None
             else None
         ),
-        "sales_yoy_growth": sales_growth_rule(soup)["status"],
+        "sales_yoy_growth": sales["status"],
         "profit_growth_over_10": status(profit_over_10 >= 2 if profit_available else None),
         "stock_cagr_below_profit_growth": status(
             price_vs_profit_passes >= 2 if price_vs_profit_available else None
         ),
-        "promoter_holding_decrease_under_5": promoter_holding_rule(soup)["status"],
+        "promoter_holding_decrease_under_5": promoter["status"],
         "peg_ratio_under_1_5": status(peg_pass),
         "revenue_quality_guard": status(rev_quality_pass),
     }
 
-    sales = sales_growth_rule(soup)
-    promoter = promoter_holding_rule(soup)
     all_rules_pass = all(rule == "pass" for rule in rule_statuses.values())
     return {
         "company_name": company_name(soup, html_path),
         "company_url": company_url,
         "html_file": html_path.name,
         "ratios": {
+            "market_cap": ratios.get("Market Cap"),
             "stock_pe": stock_pe,
             "industry_pe": industry_pe,
             "historical_pe": historical_pe,
@@ -379,6 +439,9 @@ def flatten_result(result: dict[str, Any]) -> dict[str, Any]:
         **{f"profit_growth_{key.replace(' ', '_').lower()}": value for key, value in result["profit_growth"].items()},
         **{f"stock_cagr_{key.replace(' ', '_').lower()}": value for key, value in result["stock_price_cagr"].items()},
         **counts,
+        "sales_market_category": sales.get("market_category"),
+        "sales_min_cagr": sales.get("min_sales_cagr"),
+        "sales_min_yoy_growth": sales.get("min_yoy_growth"),
         "sales_yoy_observations": sales.get("observations"),
         "sales_yoy_over_10_count": sales.get("over_10_count"),
         "sales_yoy_over_10_percentage": sales.get("over_10_percentage"),
@@ -439,7 +502,7 @@ def main() -> int:
     print(f"Analyzed {len(all_results)} company profiles.")
     print(f"Excluded financial/bank/insurance companies: {excluded_financial}.")
     print(f"Included in reports: {len(results)}.")
-    print(f"All 11 rules passed: {fully_passing}.")
+    print(f"All 12 HTML rules passed: {fully_passing}.")
     print(f"Eligible after exclusion: {eligible}.")
     print(f"Saved CSV: {csv_path}")
     print(f"Saved JSON: {json_path}")

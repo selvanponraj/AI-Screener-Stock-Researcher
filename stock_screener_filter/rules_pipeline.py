@@ -157,7 +157,7 @@ def pipeline_commands(paths: PipelinePaths) -> list[tuple[str, list[str]]]:
             ],
         ),
         (
-            "Run first 11 HTML rules",
+            "Run first 12 HTML rules",
             [
                 sys.executable,
                 "-m",
@@ -320,6 +320,25 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
         numeric(html_row, "stock_cagr_ttm"),
     ]
 
+    mcap_val = numeric(html_row, "Market Cap") or numeric(html_row, "market_cap") or numeric(excel_row, "excel_market_cap")
+    if mcap_val is None:
+        html_file = html_row.get("html_file")
+        if html_file:
+            html_path = current_paths().companies_dir / "html" / html_file
+            if html_path.is_file():
+                try:
+                    soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
+                    mcap_val = company_rule_analyzer.quick_ratios(soup).get("Market Cap")
+                except Exception:
+                    pass
+
+    if mcap_val is not None and mcap_val > 0:
+        market_cat = "Large-Cap" if mcap_val > 50000 else ("Mid-Cap" if mcap_val >= 10000 else "Small-Cap")
+        mcap_str = f"₹{fmt_number(mcap_val)} Cr"
+    else:
+        market_cat = value(html_row, 'sales_market_category') or 'Small-Cap'
+        mcap_str = 'N/A'
+
     details = {
         "pe_vs_industry": (
             f"Stock PE {fmt_number(stock_pe)} <= 1.1 * Industry PE "
@@ -335,9 +354,9 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
         "debt_to_equity_under_0_5": f"Debt to equity {fmt_number(numeric(html_row, 'debt_to_equity'))} < 0.5",
         "pledged_zero": f"Pledged percentage {fmt_percent(numeric(html_row, 'pledged_percentage'))} = 0%",
         "sales_yoy_growth": (
-            f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))} (need >= 12%); "
-            f"YoY hit rate {value(html_row, 'sales_yoy_over_10_count') or '0'}/{value(html_row, 'sales_yoy_observations') or '0'} >= 10% "
-            f"({fmt_percent(numeric(html_row, 'sales_yoy_over_10_percentage'))}, threshold 70%)"
+            f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))} (need >= {fmt_number(numeric(html_row, 'sales_min_cagr')) or ('10' if market_cat == 'Large-Cap' else ('12' if market_cat == 'Mid-Cap' else '15'))}%); "
+            f"YoY hit rate {value(html_row, 'sales_yoy_over_10_count') or '0'}/{value(html_row, 'sales_yoy_observations') or '0'} >= {fmt_number(numeric(html_row, 'sales_min_yoy_growth')) or ('10' if market_cat in ('Large-Cap', 'Mid-Cap') else '12')}% "
+            f"({fmt_percent(numeric(html_row, 'sales_yoy_over_10_percentage'))}, threshold >= 60%)"
         ),
         "profit_growth_over_10": (
             "Profit growth 10Y/5Y/3Y/TTM = "
@@ -390,9 +409,25 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
             )
         ),
         "revenue_quality_guard": (
-            f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
-            f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))}; "
-            f"need Profit >= Sales for both 3Y and 5Y"
+            (
+                f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
+                f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))}; "
+                f"Data missing"
+            )
+            if numeric(html_row, "profit_growth_3_years") is None and numeric(html_row, "profit_growth_5_years") is None
+            else (
+                (
+                    f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
+                    f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))}; "
+                    f"Operating leverage confirmed (Profit >= Sales for 3Y or 5Y)"
+                )
+                if ((numeric(html_row, "profit_growth_3_years") or -999) >= (numeric(html_row, "sales_growth_3_years") or 999)) or ((numeric(html_row, "profit_growth_5_years") or -999) >= (numeric(html_row, "sales_growth_5_years") or 999))
+                else (
+                    f"Profit CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'profit_growth_3_years'))}, {fmt_percent(numeric(html_row, 'profit_growth_5_years'))} vs "
+                    f"Sales CAGR 3Y/5Y = {fmt_percent(numeric(html_row, 'sales_growth_3_years'))}, {fmt_percent(numeric(html_row, 'sales_growth_5_years'))}; "
+                    f"Fail: Profit growth lagged Sales growth for both 3Y and 5Y"
+                )
+            )
         ),
         "rule_12_ssgr": (
             f"3Y Avg SSGR {fmt_percent(numeric(excel_row, 'ssgr_3y_avg'))} > 10% "
@@ -468,7 +503,7 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
                 "html_file": html_row.get("html_file", ""),
                 "excel_file": excel_row.get("excel_file", ""),
                 "market_categories": html_row.get("market_categories", ""),
-                "first_11_pass_count": first_passes,
+                "first_12_pass_count": first_passes,
                 "excel_rule_pass_count": excel_passes,
                 "total_rule_pass_count": total_passes,
                 "total_rule_count": total_rule_count,
@@ -723,7 +758,7 @@ def load_all_current_run_stocks(pass_percentage: float = 100.0) -> list[dict[str
                 "stock_id": s_id,
                 "company_name": html_row.get("company_name", ""),
                 "company_url": company_url,
-                "first_11_pass_count": first_passes,
+                "first_12_pass_count": first_passes,
                 "excel_rule_pass_count": excel_passes,
                 "total_rule_pass_count": total_passes,
                 "total_rule_count": total_rule_count,
@@ -892,7 +927,7 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
             "html_file": html_row.get("html_file", ""),
             "excel_file": excel_row.get("excel_file", ""),
             "market_categories": html_row.get("market_categories", ""),
-            "first_11_pass_count": first_passes,
+            "first_12_pass_count": first_passes,
             "excel_rule_pass_count": excel_passes,
             "total_rule_pass_count": total_passes,
             "total_rule_count": TOTAL_RULES,

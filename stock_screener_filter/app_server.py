@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import re
+from bs4 import BeautifulSoup
 from stock_screener_filter.config import load_env
-from stock_screener_filter import ai_evaluator, document_store, rules_pipeline
+from stock_screener_filter import ai_evaluator, document_store, rules_pipeline, company_rule_analyzer
 
 
 load_env()
@@ -22,10 +24,56 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
 
-def load_visible_stocks(pass_percentage: float = 90.0) -> list[dict[str, Any]]:
+def get_market_cap_and_category(stock: dict[str, Any]) -> tuple[float | None, str]:
+    mcap = stock.get("market_cap") or stock.get("Market Cap") or stock.get("excel_market_cap")
+    if mcap is not None:
+        try:
+            val = float(mcap)
+            if val > 0:
+                cat = "Large-Cap" if val > 50000 else ("Mid-Cap" if val >= 10000 else "Small-Cap")
+                return val, cat
+        except (TypeError, ValueError):
+            pass
+
+    company_url = str(stock.get("company_url", ""))
+    html_file = stock.get("html_file")
+    ticker_match = re.search(r"/company/([^/]+)", company_url)
+    ticker = ticker_match.group(1).upper() if ticker_match else ""
+
+    html_dir = rules_pipeline.current_paths().companies_dir / "html"
+    candidates: list[Path] = []
+    if html_file:
+        candidates.append(html_dir / html_file)
+    if ticker:
+        candidates.extend(list(html_dir.glob(f"{ticker}_*.html")))
+        candidates.extend(list(html_dir.glob(f"{ticker}.html")))
+
+    for path in candidates:
+        if path.is_file():
+            try:
+                content = path.read_text(encoding="utf-8")
+                m = re.search(r"(?:Market|Mkt)\s+Cap\s*:\s*([\d,]+(?:\.\d+)?)", content, re.I)
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    if val > 0:
+                        cat = "Large-Cap" if val > 50000 else ("Mid-Cap" if val >= 10000 else "Small-Cap")
+                        return val, cat
+                soup = BeautifulSoup(content, "html.parser")
+                ratios = company_rule_analyzer.quick_ratios(soup)
+                val = ratios.get("Market Cap")
+                if val is not None and val > 0:
+                    cat = "Large-Cap" if val > 50000 else ("Mid-Cap" if val >= 10000 else "Small-Cap")
+                    return val, cat
+            except Exception:
+                pass
+
+    return None, "Unknown"
+
+
+def load_visible_stocks(pass_percentage: float = 0.0) -> list[dict[str, Any]]:
     # Load batch screener stocks for current run, custom single stocks, and document store stocks.
     stocks_by_id: dict[str, dict[str, Any]] = {}
-    
+
     # 1. Load batch screener stocks for current run
     for stock in rules_pipeline.load_all_current_run_stocks(pass_percentage=pass_percentage):
         stock_id = str(stock["stock_id"])
@@ -43,8 +91,18 @@ def load_visible_stocks(pass_percentage: float = 90.0) -> list[dict[str, Any]]:
         if stock_id not in stocks_by_id and f"custom_{stock_id}" not in stocks_by_id:
             stocks_by_id[stock_id] = dict(stock)
 
+    enriched = []
+    for s in stocks_by_id.values():
+        val, cat = get_market_cap_and_category(s)
+        item = dict(s)
+        if val is not None:
+            item["market_cap"] = val
+            item["Market Cap"] = val
+        item["sales_market_category"] = cat
+        enriched.append(item)
+
     return sorted(
-        stocks_by_id.values(),
+        enriched,
         key=lambda stock: (
             0 if stock.get("stock_source") == "current_run" else 1,
             -float(stock.get("rule_pass_percentage") or 0),
@@ -61,7 +119,10 @@ class AppState:
         self.running = False
         self.phase = "idle"
         self.logs: list[str] = []
-        self.pass_percentage = 90.0
+        self.pass_percentage = 0.0
+        paths = rules_pipeline.current_paths()
+        if (paths.html_analysis_dir / "company_rule_results.csv").is_file():
+            rules_pipeline.combine_rule_outputs(paths, pass_percentage=self.pass_percentage)
         self.stocks: list[dict[str, Any]] = load_visible_stocks(self.pass_percentage)
         self.error: str | None = None
         self.error_trace: str | None = None
@@ -134,17 +195,22 @@ def failed_step_is_now_complete(error: str, steps: list[dict[str, Any]]) -> bool
     return False
 
 
+
 def enrich_stocks(stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     enriched = []
     for stock in stocks:
         stock_id = str(stock["stock_id"])
-        enriched.append(
-            {
-                **stock,
-                "documents": document_store.stock_documents(stock_id),
-                "ai_evaluation": ai_evaluator.load_evaluation(stock_id),
-            }
-        )
+        val, cat = get_market_cap_and_category(stock)
+        item = {
+            **stock,
+            "documents": document_store.stock_documents(stock_id),
+            "ai_evaluation": ai_evaluator.load_evaluation(stock_id),
+        }
+        if val is not None:
+            item["market_cap"] = val
+            item["Market Cap"] = val
+        item["sales_market_category"] = cat
+        enriched.append(item)
     return enriched
 
 
@@ -1036,6 +1102,29 @@ INDEX_HTML = r"""
     .rule-chip.pass { border-color: #c7e4d6; color: var(--good); background: #f3fbf7; }
     .rule-chip.fail { border-color: #f0c3bf; color: var(--bad); background: #fff7f6; }
     .rule-chip.missing { border-color: #ecd69b; color: var(--warn); background: #fffaf0; }
+
+    /* Rules Guide Modal */
+    .modal-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(4px); z-index: 9999;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.active { display: flex; }
+    .modal-card {
+      background: #ffffff; border-radius: 12px; max-width: 900px; width: 92%;
+      max-height: 85vh; overflow-y: auto; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2);
+      padding: 24px; position: relative; font-family: inherit;
+    }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 16px; }
+    .modal-header h2 { margin: 0; font-size: 20px; font-weight: 700; color: var(--fg); }
+    .close-modal-btn { background: transparent; border: none; font-size: 24px; cursor: pointer; color: var(--muted); padding: 0 4px; }
+    .close-modal-btn:hover { color: var(--fg); }
+    .rule-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 14px; }
+    .rule-card-item { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+    .rule-card-item h4 { margin: 0 0 6px 0; font-size: 14px; font-weight: 700; color: #1e293b; display: flex; align-items: center; justify-content: space-between; }
+    .rule-badge-stage { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 600; background: #e2e8f0; color: #475569; }
+    .rule-formula-box { background: #0f172a; color: #38bdf8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; padding: 6px 10px; border-radius: 4px; margin: 6px 0 8px 0; word-break: break-all; }
+    .rule-meaning-text { font-size: 13px; color: #334155; line-height: 1.45; margin: 0; }
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -1043,6 +1132,7 @@ INDEX_HTML = r"""
       .file-meta-row { grid-template-columns: 1fr; }
       section { padding: 14px; overflow-x: auto; }
       header { align-items: flex-start; flex-direction: column; }
+      .rule-card-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1050,6 +1140,7 @@ INDEX_HTML = r"""
   <header>
     <h1>Stock Researcher</h1>
       <div class="toolbar">
+      <button id="rulesGuideBtn" class="secondary" style="font-weight:600; display:flex; align-items:center; gap:5px; margin-right:4px;">📖 Rules Guide</button>
       <div style="display:flex; align-items:center; gap:6px; background:#f5f7fa; padding:3px 8px; border-radius:6px; border:1px solid var(--line);">
         <input id="tickerInput" type="text" placeholder="Ticker (e.g. TCS)" style="width:130px; padding:4px 8px; font-size:13px; border:1px solid var(--line); border-radius:4px;" />
         <button id="analyzeTickerBtn" class="secondary" style="padding:4px 10px; font-size:13px;">Analyze Ticker</button>
@@ -1057,6 +1148,7 @@ INDEX_HTML = r"""
       <label style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
         Show:
         <select id="viewFilterSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
+          <option value="all" selected>All Analyzed Stocks</option>
           <option value="batch">Batch Screener Stocks</option>
           <option value="single">Single Stocks Only</option>
         </select>
@@ -1064,6 +1156,7 @@ INDEX_HTML = r"""
       <label id="thresholdLabel" style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
         Pass Threshold:
         <select id="thresholdSelect" style="padding:4px 8px; font-size:13px; border-radius:6px; border:1px solid var(--line);">
+          <option value="0">All / 0%</option>
           <option value="50">>= 50%</option>
           <option value="60">>= 60%</option>
           <option value="75">>= 75%</option>
@@ -1118,6 +1211,92 @@ INDEX_HTML = r"""
       </table>
     </section>
   </main>
+
+  <!-- Rules Guide Modal -->
+  <div id="rulesGuideModal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>📖 Stock Screener - 14 Quantitative Rules Guide</h2>
+        <button id="closeRulesModalBtn" class="close-modal-btn">&times;</button>
+      </div>
+      <div style="font-size:13px; color:#64748b; margin-bottom:16px;">
+        Overview of all 14 quantitative filter rules, formulas, and financial meaning.
+      </div>
+      <div class="rule-card-grid">
+        <div class="rule-card-item">
+          <h4>1. PE vs Industry <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Stock P/E &le; 1.1 * Industry P/E</div>
+          <p class="rule-meaning-text">Valuation check vs industry. Ensures the company is not overpriced relative to its sector peers (allows up to 10% premium).</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>2. PE vs History <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Stock P/E &le; 1.1 * Historical P/E (&ge;2 of 3Y/5Y/7Y)</div>
+          <p class="rule-meaning-text">Valuation check vs own past. Verifies current valuation is reasonable compared to its own historical median multiples.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>3. ROCE > 15% <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">ROCE > 15.0%</div>
+          <p class="rule-meaning-text">Operating efficiency. Generates at least ₹15 operating profit for every ₹100 of total capital employed.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>4. ROE > 15% <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">ROE > 15.0%</div>
+          <p class="rule-meaning-text">Shareholder returns. Measures net profit profitability on equity shareholders' capital.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>5. Debt to Equity < 0.5 <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Total Debt / Total Equity < 0.5</div>
+          <p class="rule-meaning-text">Solvency check. Low financial risk (debt burden is less than half of shareholder equity).</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>6. Pledged Shares = 0% <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Promoter Pledged % == 0%</div>
+          <p class="rule-meaning-text">Promoter safety check. Zero pledged shares eliminates risk of forced margin liquidations.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>7. Sales YoY & CAGR Growth <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Large-Cap: &ge;10% CAGR | Mid-Cap: &ge;12% CAGR | Small-Cap: &ge;15% CAGR</div>
+          <p class="rule-meaning-text">Market-cap tiered growth. Requires 60% hit rate over 10 YoY annual observations tailored by company size.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>8. Profit Growth > 10% <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Profit Growth > 10% (&ge;2 of 10Y/5Y/3Y/TTM)</div>
+          <p class="rule-meaning-text">Earnings consistency. Double-digit profit growth across historical time windows.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>9. Stock CAGR < Profit Growth <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Stock CAGR < Profit Growth (&ge;2 matching periods)</div>
+          <p class="rule-meaning-text">Valuation headroom. Stock price growth has not outstripped underlying profit growth.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>10. Promoter Decrease < 5% <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">First Promoter % - Latest Promoter % < 5%</div>
+          <p class="rule-meaning-text">Skin-in-the-game. Key founders have maintained their ownership stake over time.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>11. PEG Ratio <= 1.5 <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Stock P/E / Effective Profit CAGR &le; 1.5</div>
+          <p class="rule-meaning-text">Growth-adjusted valuation (Peter Lynch Rule). Ensures fair price paid relative to profit growth rate.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>12. Revenue Quality Guard <span class="rule-badge-stage">Stage 1 (HTML)</span></h4>
+          <div class="rule-formula-box">Profit CAGR (3Y) &ge; Sales CAGR (3Y) OR Profit CAGR (5Y) &ge; Sales CAGR (5Y)</div>
+          <p class="rule-meaning-text">Margin quality & operating leverage. Profit growth matches or exceeds sales growth over 3Y or 5Y.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>13. Rule 12: SSGR <span class="rule-badge-stage">Stage 2 (Excel)</span></h4>
+          <div class="rule-formula-box">3Y Avg SSGR > 10% AND SSGR &ge; 3Y Sales CAGR</div>
+          <p class="rule-meaning-text">Self-funded growth. Company can fund sales expansion using internal retained cash without raising debt.</p>
+        </div>
+        <div class="rule-card-item">
+          <h4>14. Rule 13: CFO / EBITDA & CFO / PAT <span class="rule-badge-stage">Stage 2 (Excel)</span></h4>
+          <div class="rule-formula-box">5Y Cum. CFO / EBITDA &ge; 65% AND CFO / PAT &ge; 80%</div>
+          <p class="rule-meaning-text">Cash flow conversion. Guarantees accounting profits turn into real operating cash flow rather than unpaid receivables.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     let latest = {};
     let qaAnswers = {};
@@ -1199,7 +1378,7 @@ INDEX_HTML = r"""
         Array.from(document.querySelectorAll('details.qa-trace[open]'))
           .map(detail => detail.dataset.stock)
       );
-      const viewMode = ($('viewFilterSelect') && $('viewFilterSelect').value) || 'batch';
+      const viewMode = ($('viewFilterSelect') && $('viewFilterSelect').value) || 'all';
       if ($('thresholdSelect') && $('thresholdNaBadge')) {
         if (viewMode === 'single') {
           $('thresholdSelect').style.display = 'none';
@@ -1234,90 +1413,103 @@ INDEX_HTML = r"""
           ? `Displaying ${visibleStocks.length} analyzed stocks. Click 🔄 Refresh to force re-downloading reports & Excel for any stock.`
           : 'Run single stock analysis or Screener pipeline to view stocks.');
       for (const stock of visibleStocks) {
-        const tr = document.createElement('tr');
-        const docs = stock.documents || [];
-        const ai = stock.ai_evaluation || {};
-        const rules = stock.rule_details || ruleDetailsFromStock(stock);
-        const isRuleFiltered = stock.stock_source === 'rule_filtered' || stock.stock_source === 'current_run' || stock.stock_source === 'custom_single_stock' || stock.total_rule_count > 0;
-        const sourceLabel = stock.stock_source === 'custom_single_stock' || stock.is_custom_single_stock
-          ? 'Custom Stock'
-          : (stock.stock_source === 'current_run' ? 'Current Run' : (stock.stock_source === 'rule_filtered' ? 'Rule filtered' : 'Document library'));
-        const reasons = ai.key_reasons || [];
-        const isEvaluating = evaluatingStockId && evaluatingStockId === stock.stock_id && latest.running;
-        const sectionBreakdown = renderSectionBreakdown(ai.section_analyses || {});
-        tr.innerHTML = `
-          <td>
-            <div style="display: inline-flex; align-items: center; gap: 6px;">
-              <span class="stock-name" style="font-weight: 600;">${escapeHtml(stock.company_name)}</span>
-              <button class="secondary btn-sm refresh-one" style="padding: 1px 5px; font-size: 0.85rem; line-height: 1; border-radius: 4px; cursor: pointer;" data-stock="${escapeAttr(stock.stock_id)}" data-name="${escapeAttr(stock.company_name)}" title="Re-download HTML, Excel & Reports for ${escapeAttr(stock.company_name)}">🔄</button>
-            </div>
-            <div class="muted">${escapeHtml(stock.market_categories || '')}</div>
-
-            <div class="muted">${escapeHtml(stock.company_url || '')}</div>
-            <div class="muted"><span class="badge" style="font-size: 0.75rem; font-weight: normal;">${sourceLabel}</span></div>
-          </td>
-          <td>
-            ${isRuleFiltered ? `
-              <span class="badge">${stock.total_rule_pass_count ?? 0}/${stock.total_rule_count ?? 14}</span>
-              <div class="muted">${stock.rule_pass_percentage ?? 0}% passed</div>
-              <div class="muted">Rule score: ${stock.rule_score_out_of_50 ?? 0}/50</div>
-            ` : `
-              <span class="badge">Documents</span>
-              <div class="muted">No current rule-filter output for this stock.</div>
-            `}
-            ${isRuleFiltered ? `<details class="rule-details" data-stock="${escapeAttr(stock.stock_id)}" ${openDetails.has(stock.stock_id) ? 'open' : ''}>
-              <summary class="muted">Rule details</summary>
-              <div class="rule-grid">
-                ${rules.map(rule => `
-                  <div class="rule-chip ${escapeAttr(rule.status)}">
-                    <strong>${escapeHtml(shortRuleName(rule.name))}: ${escapeHtml(rule.status)}</strong>
-                    <div class="rule-detail">${escapeHtml(rule.detail || '')}</div>
-                  </div>
-                `).join('')}
+        try {
+          const tr = document.createElement('tr');
+          const docs = stock.documents || [];
+          const ai = stock.ai_evaluation || {};
+          const rules = stock.rule_details || ruleDetailsFromStock(stock);
+          const isRuleFiltered = stock.stock_source === 'rule_filtered' || stock.stock_source === 'current_run' || stock.stock_source === 'custom_single_stock' || stock.total_rule_count > 0;
+          const sourceLabel = stock.stock_source === 'custom_single_stock' || stock.is_custom_single_stock
+            ? 'Custom Stock'
+            : (stock.stock_source === 'current_run' ? 'Current Run' : (stock.stock_source === 'rule_filtered' ? 'Rule filtered' : 'Document library'));
+          const mcapRaw = stock['Market Cap'] ?? stock['market_cap'] ?? stock['excel_market_cap'];
+          const mcapNum = (mcapRaw !== undefined && mcapRaw !== null && mcapRaw !== '' && !isNaN(Number(mcapRaw))) ? Number(mcapRaw) : null;
+          const category = stock.sales_market_category || (mcapNum !== null ? (mcapNum > 50000 ? 'Large-Cap' : (mcapNum >= 10000 ? 'Mid-Cap' : (mcapNum > 0 ? 'Small-Cap' : 'Unknown'))) : 'Unknown');
+          const mcapFormatted = mcapNum ? `₹${mcapNum.toLocaleString('en-IN')} Cr` : 'N/A';
+          const badgeBg = category === 'Large-Cap' ? '#dbeafe' : (category === 'Mid-Cap' ? '#fef3c7' : (category === 'Small-Cap' ? '#e0e7ff' : '#f3f4f6'));
+          const badgeColor = category === 'Large-Cap' ? '#1d4ed8' : (category === 'Mid-Cap' ? '#b45309' : (category === 'Small-Cap' ? '#4338ca' : '#6b7280'));
+          const reasons = ai.key_reasons || [];
+          const isEvaluating = evaluatingStockId && evaluatingStockId === stock.stock_id && latest.running;
+          const sectionBreakdown = renderSectionBreakdown(ai ? ai.section_analyses : null);
+          tr.innerHTML = `
+            <td>
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px;">
+                <span class="stock-name" style="font-weight: 700; font-size: 1.05rem;">${escapeHtml(stock.company_name)}</span>
+                <span class="badge category-badge" style="font-size: 0.75rem; font-weight: 600; background: ${badgeBg}; color: ${badgeColor}; border: 1px solid rgba(0,0,0,0.1); padding: 2px 8px; border-radius: 12px;">${category}</span>
+                <button class="secondary btn-sm refresh-one" style="padding: 1px 5px; font-size: 0.85rem; line-height: 1; border-radius: 4px; cursor: pointer;" data-stock="${escapeAttr(stock.stock_id)}" data-name="${escapeAttr(stock.company_name)}" title="Re-download HTML, Excel & Reports for ${escapeAttr(stock.company_name)}">🔄</button>
               </div>
-            </details>` : ''}
-          </td>
-          <td>
-            <form class="upload" data-stock="${stock.stock_id}" data-name="${escapeAttr(stock.company_name)}">
-              <input type="file" name="file" multiple accept=".pdf,.txt,.md,.html,.htm,.csv,.json">
-              <div class="file-meta"></div>
-              <button type="submit" class="secondary">Upload</button>
-            </form>
-            <div class="docs">${docs.length} document(s), ${docs.reduce((a,d)=>a+(d.chunk_count||0),0)} chunks</div>
-            <form class="qa-box" data-stock="${stock.stock_id}">
-              <textarea name="question" placeholder="Ask this stock's uploaded documents"></textarea>
-              <button type="submit" class="secondary">Ask Documents</button>
-            </form>
-            <div class="qa-answer" id="qa-${escapeAttr(stock.stock_id)}" style="${qaAnswers[stock.stock_id] ? '' : 'display:none;'}">${renderQaAnswer(qaAnswers[stock.stock_id], stock.stock_id, openTraces.has(stock.stock_id))}</div>
-          </td>
-          <td>
-            ${isRuleFiltered ? `
-              ${isEvaluating ? `
-                <span class="badge">Evaluating</span>
-                <div class="inline-progress"><div class="inline-progress-fill"></div></div>
-                <div class="muted">${escapeHtml(latest.current_step || 'Running AI evaluation')}</div>
+              <div style="font-size: 0.85rem; font-weight: 600; color: #1e293b; margin-bottom: 2px;">
+                Market Cap: <span style="color: #059669;">${mcapFormatted}</span>
+              </div>
+              <div class="muted" style="font-size: 0.8rem;">${escapeHtml(stock.market_categories || '')}</div>
+              <div class="muted" style="font-size: 0.8rem;">${escapeHtml(stock.company_url || '')}</div>
+              <div class="muted" style="margin-top: 4px;"><span class="badge" style="font-size: 0.75rem; font-weight: normal;">${sourceLabel}</span></div>
+            </td>
+            <td>
+              ${isRuleFiltered ? `
+                <span class="badge">${stock.total_rule_pass_count ?? 0}/${stock.total_rule_count ?? 14}</span>
+                <div class="muted">${stock.rule_pass_percentage ?? 0}% passed</div>
+                <div class="muted">Rule score: ${stock.rule_score_out_of_50 ?? 0}/50</div>
               ` : `
-                ${ai.total_score_out_of_100 !== undefined ? `<span class="badge" title="Total Combined Score (Rule Score + AI Score)">Total: ${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
-                <div class="muted">AI score: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
-                <button class="secondary eval-one" data-stock="${stock.stock_id}">Evaluate</button>
+                <span class="badge">Documents</span>
+                <div class="muted">No current rule-filter output for this stock.</div>
               `}
-            ` : '<span class="muted">Document Q&A only</span>'}
-          </td>
-          <td>
-            ${ai.verdict ? `
-              <div class="verdict-box">
-                <div class="verdict-text">${escapeHtml(ai.verdict)}</div>
-                ${reasons.length ? `
-                  <ul class="reason-list">
-                    ${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join('')}
-                  </ul>
-                ` : ''}
-                ${sectionBreakdown}
-              </div>
-            ` : '<span class="muted">No verdict yet</span>'}
-          </td>
-        `;
-        body.appendChild(tr);
+              ${isRuleFiltered ? `<details class="rule-details" data-stock="${escapeAttr(stock.stock_id)}" ${openDetails.has(stock.stock_id) ? 'open' : ''}>
+                <summary class="muted">Rule details</summary>
+                <div class="rule-grid">
+                  ${rules.map(rule => `
+                    <div class="rule-chip ${escapeAttr(rule.status)}">
+                      <strong>${escapeHtml(shortRuleName(rule.name))}: ${escapeHtml(rule.status)}</strong>
+                      <div class="rule-detail">${escapeHtml(rule.detail || '')}</div>
+                    </div>
+                  `).join('')}
+                </div>
+              </details>` : ''}
+            </td>
+            <td>
+              <form class="upload" data-stock="${stock.stock_id}" data-name="${escapeAttr(stock.company_name)}">
+                <input type="file" name="file" multiple accept=".pdf,.txt,.md,.html,.htm,.csv,.json">
+                <div class="file-meta"></div>
+                <button type="submit" class="secondary">Upload</button>
+              </form>
+              <div class="docs">${docs.length} document(s), ${docs.reduce((a,d)=>a+(d.chunk_count||0),0)} chunks</div>
+              <form class="qa-box" data-stock="${stock.stock_id}">
+                <textarea name="question" placeholder="Ask this stock's uploaded documents"></textarea>
+                <button type="submit" class="secondary">Ask Documents</button>
+              </form>
+              <div class="qa-answer" id="qa-${escapeAttr(stock.stock_id)}" style="${qaAnswers[stock.stock_id] ? '' : 'display:none;'}">${renderQaAnswer(qaAnswers[stock.stock_id], stock.stock_id, openTraces.has(stock.stock_id))}</div>
+            </td>
+            <td>
+              ${isRuleFiltered ? `
+                ${isEvaluating ? `
+                  <span class="badge">Evaluating</span>
+                  <div class="inline-progress"><div class="inline-progress-fill"></div></div>
+                  <div class="muted">${escapeHtml(latest.current_step || 'Running AI evaluation')}</div>
+                ` : `
+                  ${ai.total_score_out_of_100 !== undefined ? `<span class="badge" title="Total Combined Score (Rule Score + AI Score)">Total: ${ai.total_score_out_of_100}/100</span>` : '<span class="muted">Not run</span>'}
+                  <div class="muted">AI score: ${ai.ai_score_out_of_50 ?? '-'}/50</div>
+                  <button class="secondary eval-one" data-stock="${stock.stock_id}">Evaluate</button>
+                `}
+              ` : '<span class="muted">Document Q&A only</span>'}
+            </td>
+            <td>
+              ${ai.verdict ? `
+                <div class="verdict-box">
+                  <div class="verdict-text">${escapeHtml(ai.verdict)}</div>
+                  ${reasons.length ? `
+                    <ul class="reason-list">
+                      ${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join('')}
+                    </ul>
+                  ` : ''}
+                  ${sectionBreakdown}
+                </div>
+              ` : '<span class="muted">No verdict yet</span>'}
+            </td>
+          `;
+          body.appendChild(tr);
+        } catch (err) {
+          console.error('Error rendering stock row:', err, stock);
+        }
       }
       document.querySelectorAll('form.upload').forEach(form => {
         form.addEventListener('submit', uploadForm);
@@ -1536,6 +1728,7 @@ INDEX_HTML = r"""
       return names[sectionId] || sectionId;
     }
     function renderSectionBreakdown(sections) {
+      if (!sections) return '';
       const order = [
         'future_outlook',
         'initiatives_progress',
@@ -1692,6 +1885,18 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
         alert(`Failed to trigger ticker analysis: ${err.message}`);
       }
     }
+    $('rulesGuideBtn').addEventListener('click', () => {
+      $('rulesGuideModal').classList.add('active');
+    });
+    $('closeRulesModalBtn').addEventListener('click', () => {
+      $('rulesGuideModal').classList.remove('active');
+    });
+    $('rulesGuideModal').addEventListener('click', (e) => {
+      if (e.target === $('rulesGuideModal')) {
+        $('rulesGuideModal').classList.remove('active');
+      }
+    });
+
     $('analyzeTickerBtn').addEventListener('click', handleAnalyzeTicker);
     $('tickerInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') handleAnalyzeTicker();
@@ -1725,7 +1930,7 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     });
     setInterval(refresh, 4000);
     refresh().then(() => {
-      if (latest.pass_percentage) {
+      if (latest.pass_percentage !== undefined && latest.pass_percentage !== null) {
         $('thresholdSelect').value = String(latest.pass_percentage);
       }
     });
