@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from bs4 import BeautifulSoup
+
+from stock_screener_filter import company_rule_analyzer
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CURRENT_RUN_DIR = PROJECT_ROOT / "data" / "current_run"
@@ -303,6 +307,22 @@ def count_price_below_profit(html_row: dict[str, str]) -> int:
     )
 
 
+_FALLBACK_CACHE: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+
+def get_cached_html_fallback(valid_path: Path, sales_cagr_3y: float | None, roe: float | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    key = str(valid_path.resolve())
+    if key not in _FALLBACK_CACHE:
+        try:
+            soup = BeautifulSoup(valid_path.read_text(encoding="utf-8"), "html.parser")
+            cfo_fb = company_rule_analyzer.calculate_fallback_cfo_ebitda_pat(soup)
+            ssgr_fb = company_rule_analyzer.calculate_fallback_ssgr(soup, sales_cagr_3y, roe)
+            _FALLBACK_CACHE[key] = (cfo_fb, ssgr_fb)
+        except Exception:
+            _FALLBACK_CACHE[key] = ({}, {})
+    return _FALLBACK_CACHE[key]
+
+
 def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) -> str:
     stock_pe = numeric(html_row, "stock_pe")
     industry_pe = numeric(html_row, "industry_pe")
@@ -338,6 +358,37 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
     else:
         market_cat = value(html_row, 'sales_market_category') or 'Small-Cap'
         mcap_str = 'N/A'
+
+    ssgr_val = numeric(excel_row, 'ssgr_3y_avg') if numeric(excel_row, 'ssgr_3y_avg') is not None else numeric(html_row, 'ssgr_3y_avg')
+    ssgr_sales_cagr = numeric(excel_row, 'excel_sales_cagr_3y') if numeric(excel_row, 'excel_sales_cagr_3y') is not None else numeric(html_row, 'sales_growth_3_years')
+    cfo_val = numeric(excel_row, 'cum_cfo_5y') if numeric(excel_row, 'cum_cfo_5y') is not None else numeric(html_row, 'cum_cfo_5y')
+    ebitda_val = numeric(excel_row, 'cum_ebitda_5y') if numeric(excel_row, 'cum_ebitda_5y') is not None else numeric(html_row, 'cum_ebitda_5y')
+    cfo_ebitda_ratio = numeric(excel_row, 'cfo_ebitda_cum_ratio') if numeric(excel_row, 'cfo_ebitda_cum_ratio') is not None else numeric(html_row, 'cfo_ebitda_cum_ratio')
+    cfo_pat_ratio = numeric(excel_row, 'cfo_pat_cum_ratio') if numeric(excel_row, 'cfo_pat_cum_ratio') is not None else numeric(html_row, 'cfo_pat_cum_ratio')
+
+    if (ssgr_val is None or cfo_val is None) and (html_row.get("html_file") or html_row.get("company_url") or html_row.get("company_name")):
+        html_file = str(html_row.get("html_file") or "")
+        target_sym = normalize_company_symbol(html_row.get("company_url")) or normalize_company_symbol(html_row.get("stock_id"))
+        prefix = html_file.split("_")[0].upper() if html_file else ""
+        possible_paths = [
+            current_paths().companies_dir / "html" / html_file if html_file else None,
+            current_paths().companies_dir / "html" / f"{target_sym}.html" if target_sym else None,
+            current_paths().companies_dir / "html" / f"{prefix}.html" if prefix else None,
+            CUSTOM_STOCKS_DIR / "html" / html_file if html_file else None,
+            CUSTOM_STOCKS_DIR / "html" / f"{target_sym}.html" if target_sym else None,
+            CUSTOM_STOCKS_DIR / "html" / f"{prefix}.html" if prefix else None,
+        ]
+        valid_path = next((p for p in possible_paths if p and p.is_file()), None)
+
+        if valid_path:
+            cfo_fb, ssgr_fb = get_cached_html_fallback(valid_path, ssgr_sales_cagr, numeric(html_row, "roe"))
+            if cfo_val is None:
+                cfo_val = numeric(cfo_fb, "cum_cfo_5y")
+                ebitda_val = numeric(cfo_fb, "cum_ebitda_5y")
+                cfo_ebitda_ratio = numeric(cfo_fb, "cfo_ebitda_cum_ratio")
+                cfo_pat_ratio = numeric(cfo_fb, "cfo_pat_cum_ratio")
+            if ssgr_val is None:
+                ssgr_val = numeric(ssgr_fb, "ssgr_3y_avg")
 
     details = {
         "pe_vs_industry": (
@@ -430,14 +481,14 @@ def rule_detail(rule: str, html_row: dict[str, str], excel_row: dict[str, str]) 
             )
         ),
         "rule_12_ssgr": (
-            f"3Y Avg SSGR {fmt_percent(numeric(excel_row, 'ssgr_3y_avg'))} > 10% "
-            f"and >= 3Y Excel Sales CAGR {fmt_percent(numeric(excel_row, 'excel_sales_cagr_3y'))}"
+            f"3Y Avg SSGR {fmt_percent(ssgr_val)} > 10% "
+            f"and >= 3Y Sales CAGR {fmt_percent(ssgr_sales_cagr)}"
         ),
         "rule_13_cfo_ebitda": (
-            f"Cum 5Y CFO/EBITDA = {fmt_number(numeric(excel_row, 'cum_cfo_5y'))} / "
-            f"{fmt_number(numeric(excel_row, 'cum_ebitda_5y'))} = "
-            f"{fmt_percent(numeric(excel_row, 'cfo_ebitda_cum_ratio'))} (>= 65%); "
-            f"CFO/PAT = {fmt_percent(numeric(excel_row, 'cfo_pat_cum_ratio'))} (>= 80%)"
+            f"Cum 5Y CFO/EBITDA = {fmt_number(cfo_val)} / "
+            f"{fmt_number(ebitda_val)} = "
+            f"{fmt_percent(cfo_ebitda_ratio)} (>= 65%); "
+            f"CFO/PAT = {fmt_percent(cfo_pat_ratio)} (>= 80%)"
         ),
     }
     return details.get(rule, "")
@@ -454,7 +505,7 @@ def build_rule_details(html_row: dict[str, str], excel_row: dict[str, str]) -> l
     ] + [
         {
             "name": column,
-            "status": excel_row.get(column, ""),
+            "status": excel_row.get(column, "") or html_row.get(column, ""),
             "detail": rule_detail(column, html_row, excel_row),
         }
         for column in EXCEL_RULE_COLUMNS
@@ -469,12 +520,16 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
 
     excel_csv = paths.excel_analysis_dir / "excel_rule_results.csv"
     excel_by_url: dict[str, dict[str, str]] = {}
+    excel_by_symbol: dict[str, dict[str, str]] = {}
     if excel_csv.is_file():
         with excel_csv.open(newline="", encoding="utf-8") as csv_file:
             for row in csv.DictReader(csv_file):
                 url = row.get("company_url", "").rstrip("/")
                 if url:
                     excel_by_url[url] = row
+                    sym = normalize_company_symbol(url)
+                    if sym:
+                        excel_by_symbol[sym] = row
 
     with html_csv.open(newline="", encoding="utf-8") as csv_file:
         html_rows = list(csv.DictReader(csv_file))
@@ -483,7 +538,12 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
     for html_row in html_rows:
         company_url = html_row.get("company_url", "")
         clean_url = company_url.rstrip("/")
-        excel_row = excel_by_url.get(clean_url, {})
+        target_sym = normalize_company_symbol(company_url) or normalize_company_symbol(html_row.get("company_name", ""))
+        
+        excel_row = excel_by_url.get(clean_url) or excel_by_symbol.get(target_sym, {})
+
+        html_file_name = f"{target_sym}.html" if (paths.companies_dir / "html" / f"{target_sym}.html").is_file() else html_row.get("html_file", "")
+        excel_file_name = f"{target_sym}.xlsx" if (paths.companies_dir / "excel" / f"{target_sym}.xlsx").is_file() else excel_row.get("excel_file", "")
 
         first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
         excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
@@ -500,8 +560,6 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
                 "stock_id": stock_id(html_row.get("company_name", ""), company_url),
                 "company_name": html_row.get("company_name", ""),
                 "company_url": company_url,
-                "html_file": html_row.get("html_file", ""),
-                "excel_file": excel_row.get("excel_file", ""),
                 "market_categories": html_row.get("market_categories", ""),
                 "first_12_pass_count": first_passes,
                 "excel_rule_pass_count": excel_passes,
@@ -512,6 +570,8 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
                 "passes_final_rule_filter": passes_filter,
                 **html_row,
                 **excel_row,
+                "html_file": html_file_name,
+                "excel_file": excel_file_name,
                 "rule_details": build_rule_details(html_row, excel_row),
             }
         )
@@ -523,8 +583,13 @@ def combine_rule_outputs(paths: PipelinePaths, pass_percentage: float | None = N
     filtered = [row for row in combined if row["passes_final_rule_filter"]]
     json_path.write_text(json.dumps(filtered, indent=2), encoding="utf-8")
     if filtered:
+        fieldnames: list[str] = []
+        for row in filtered:
+            for k in row.keys():
+                if k not in fieldnames:
+                    fieldnames.append(k)
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=list(filtered[0]))
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(filtered)
     else:
@@ -633,11 +698,13 @@ def pipeline_status(pass_percentage: float | None = None) -> list[dict[str, obje
 
 
 def stock_id(company_name: str, company_url: str) -> str:
+    sym = normalize_company_symbol(company_url) or normalize_company_symbol(company_name)
+    if sym:
+        return sym
     import hashlib
     import re
 
     base = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-") or "stock"
-    # The URL digest disambiguates companies whose normalized names collide.
     digest = hashlib.sha256(company_url.encode("utf-8")).hexdigest()[:8]
     return f"{base}-{digest}"
 
@@ -780,35 +847,70 @@ CUSTOM_STOCKS_DIR = PROJECT_ROOT / "data" / "custom_stocks"
 def load_custom_stocks() -> list[dict[str, object]]:
     if not CUSTOM_STOCKS_DIR.exists():
         return []
-    results: list[dict[str, object]] = []
-    for json_file in CUSTOM_STOCKS_DIR.glob("*.json"):
+    
+    seen_symbols: dict[str, tuple[Path, dict[str, object]]] = {}
+    for json_file in CUSTOM_STOCKS_DIR.rglob("*.json"):
+        if json_file.name == "custom_rule_results.json":
+            continue
         try:
             stock = json.loads(json_file.read_text(encoding="utf-8"))
             if isinstance(stock, dict) and "stock_id" in stock:
-                # Refresh rule_details using all stock fields so old saved custom JSONs get full details strings
-                stock_str_dict = {k: str(v) if v is not None else "" for k, v in stock.items()}
-                stock["rule_details"] = build_rule_details(stock_str_dict, stock_str_dict)
-                results.append(stock)
+                sym = normalize_company_symbol(stock.get("company_url")) or normalize_company_symbol(stock.get("stock_id")) or json_file.stem.upper()
+                if not sym:
+                    continue
+                
+                stock["stock_id"] = sym
+                if (CUSTOM_STOCKS_DIR / "html" / f"{sym}.html").is_file():
+                    stock["html_file"] = f"{sym}.html"
+                if (CUSTOM_STOCKS_DIR / "excel" / f"{sym}.xlsx").is_file():
+                    stock["excel_file"] = f"{sym}.xlsx"
+
+                # Deduplicate: If duplicate symbol found, keep the newer file and delete the older one
+                if sym in seen_symbols:
+                    old_path, old_stock = seen_symbols[sym]
+                    if json_file.stat().st_mtime > old_path.stat().st_mtime:
+                        old_path.unlink(missing_ok=True)
+                        seen_symbols[sym] = (json_file, stock)
+                    else:
+                        json_file.unlink(missing_ok=True)
+                else:
+                    seen_symbols[sym] = (json_file, stock)
         except Exception:
             continue
+
+    results: list[dict[str, object]] = []
+    for json_path, stock in seen_symbols.values():
+        stock_str_dict = {k: str(v) if v is not None else "" for k, v in stock.items()}
+        stock["rule_details"] = build_rule_details(stock_str_dict, stock_str_dict)
+        results.append(stock)
     return results
 
 
-def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: bool = False) -> dict[str, object]:
+def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: bool = False, target_scope: str | None = None) -> dict[str, object]:
     input_str = ticker_or_url.strip()
     if not input_str:
         raise ValueError("Ticker or URL cannot be empty.")
 
-    if input_str.startswith("http://") or input_str.startswith("https://"):
-        company_url = input_str if input_str.endswith("/") else f"{input_str}/"
-    else:
-        symbol = input_str.upper().strip("/")
-        company_url = f"https://www.screener.in/company/{symbol}/"
+    company_url, symbol = resolve_screener_url(input_str)
 
     CUSTOM_STOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    paths = current_paths()
+
+    # Determine target scope if unspecified
+    if not target_scope:
+        current_csv = paths.html_analysis_dir / "company_rule_results.csv"
+        is_curr = False
+        if current_csv.is_file():
+            with current_csv.open(newline="", encoding="utf-8") as f:
+                is_curr = any(
+                    normalize_company_symbol(r.get("company_url")) == symbol or
+                    normalize_company_symbol(r.get("stock_id")) == symbol
+                    for r in csv.DictReader(f)
+                )
+        target_scope = "current_run" if is_curr else "custom_stocks"
 
     # Check if stock already exists in custom_stocks cache
-    if not force:
+    if not force and target_scope == "custom_stocks":
         for json_file in CUSTOM_STOCKS_DIR.glob("*.json"):
             try:
                 cached = json.loads(json_file.read_text(encoding="utf-8"))
@@ -818,7 +920,7 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
             except Exception:
                 continue
 
-    log(f"Analyzing single stock ticker from Screener: {company_url}")
+    log(f"Analyzing single stock ticker from Screener: {company_url} [Target Scope: {target_scope}]")
     temp_dir = CUSTOM_STOCKS_DIR / "_temp_run"
     if temp_dir.exists():
         shutil.rmtree(temp_dir)
@@ -915,17 +1017,18 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
                     excel_row = excel_rows[0]
 
         first_passes = pass_count(html_row, FIRST_STAGE_RULE_COLUMNS)
-        excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS)
+        excel_passes = pass_count(excel_row, EXCEL_RULE_COLUMNS) if excel_row else pass_count(html_row, EXCEL_RULE_COLUMNS)
         total_passes = first_passes + excel_passes
         rule_score = round((total_passes / TOTAL_RULES) * 50, 2)
+
+        # Determine target directory
+        target_sym = normalize_company_symbol(company_url) or normalize_company_symbol(html_row.get("company_name", ""))
 
         s_id = stock_id(html_row["company_name"], html_row["company_url"])
         stock_data: dict[str, object] = {
             "stock_id": s_id,
             "company_name": html_row["company_name"],
             "company_url": html_row["company_url"],
-            "html_file": html_row.get("html_file", ""),
-            "excel_file": excel_row.get("excel_file", ""),
             "market_categories": html_row.get("market_categories", ""),
             "first_12_pass_count": first_passes,
             "excel_rule_pass_count": excel_passes,
@@ -937,16 +1040,207 @@ def analyze_single_stock(ticker_or_url: str, log: Callable[[str], None], force: 
             "is_custom_single_stock": True,
             **html_row,
             **excel_row,
+            "html_file": f"{target_sym}.html",
+            "excel_file": f"{target_sym}.xlsx" if excel_row else "",
             "rule_details": build_rule_details(html_row, excel_row),
         }
 
-        save_path = CUSTOM_STOCKS_DIR / f"{s_id}.json"
-        save_path.write_text(json.dumps(stock_data, indent=2), encoding="utf-8")
-        log(f"Successfully analyzed {html_row['company_name']}! Saved to custom stocks.")
+        target_base = paths.companies_dir if target_scope == "current_run" else CUSTOM_STOCKS_DIR
+        target_html_dir = target_base / "html"
+        target_excel_dir = target_base / "excel"
+        target_html_dir.mkdir(parents=True, exist_ok=True)
+        target_excel_dir.mkdir(parents=True, exist_ok=True)
+
+        temp_html_name = html_row.get("html_file", "")
+        if temp_html_name:
+            possible_html_paths = [
+                profiles_dir / temp_html_name,
+                profiles_dir / "html" / temp_html_name,
+                profiles_dir / "html" / Path(temp_html_name).name,
+                profiles_dir / Path(temp_html_name).name,
+            ]
+            valid_html_path = next((p for p in possible_html_paths if p.is_file()), None)
+            if valid_html_path:
+                for old_f in target_html_dir.glob(f"{target_sym}*"):
+                    old_f.unlink(missing_ok=True)
+                shutil.copy2(valid_html_path, target_html_dir / f"{target_sym}.html")
+                stock_data["html_file"] = f"{target_sym}.html"
+
+        # Copy any downloaded Excel exports from temporary excel_dir to target_excel_dir
+        if excel_dir.is_dir():
+            for xfile in excel_dir.glob("*.xlsx"):
+                for old_f in target_excel_dir.glob(f"{target_sym}*"):
+                    old_f.unlink(missing_ok=True)
+                shutil.copy2(xfile, target_excel_dir / f"{target_sym}.xlsx")
+                stock_data["excel_file"] = f"{target_sym}.xlsx"
+
+        stock_data["is_current_run"] = (target_scope == "current_run")
+        upsert_current_run_stock(stock_data, target_scope=target_scope)
+        log(f"Successfully analyzed {html_row['company_name']}! Target scope: {target_scope}")
         return stock_data
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def normalize_company_symbol(url_or_name: str | None) -> str:
+    import re
+    if not url_or_name:
+        return ""
+    clean_url = re.sub(r"/consolidated/?$", "", str(url_or_name).strip().rstrip("/"), flags=re.I)
+    return clean_url.split("/")[-1].upper()
+
+
+def resolve_screener_url(identifier: str) -> tuple[str, str]:
+    """Resolve an input string, stock_id, or company name to a valid Screener consolidated company URL and symbol."""
+    import re
+    cleaned = identifier.strip()
+    if not cleaned:
+        return "", ""
+
+    sym = ""
+    if cleaned.startswith("http://") or cleaned.startswith("https://"):
+        sym = normalize_company_symbol(cleaned)
+    else:
+        paths = current_paths()
+        csv_paths = [
+            CUSTOM_STOCKS_DIR / "analysis" / "custom_rule_results.csv",
+            paths.html_analysis_dir / "company_rule_results.csv",
+        ]
+        for c_path in csv_paths:
+            if c_path.is_file():
+                try:
+                    with c_path.open(newline="", encoding="utf-8") as f:
+                        for row in csv.DictReader(f):
+                            row_name = row.get("company_name", "")
+                            row_url = row.get("company_url", "")
+                            row_id = row.get("stock_id", "") or (stock_id(row_name, row_url) if row_name and row_url else "")
+                            if (row_id and row_id.lower() == cleaned.lower()) or (row_name and row_name.lower() == cleaned.lower()):
+                                sym = normalize_company_symbol(row_url) or normalize_company_symbol(row_name)
+                                break
+                except Exception:
+                    continue
+            if sym:
+                break
+
+    if not sym:
+        sym = normalize_company_symbol(cleaned)
+
+    return f"https://www.screener.in/company/{sym}/consolidated/", sym
+
+
+def _upsert_csv_json_entry(csv_path: Path, json_path: Path, entry: dict[str, object], target_sym: str) -> None:
+    """Upsert a single record into specified CSV and JSON files matching target_sym."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if csv_path.is_file():
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        fieldnames = list(rows[0].keys()) if rows else list(entry.keys())
+
+        updated = False
+        for row in rows:
+            row_sym = normalize_company_symbol(row.get("company_url")) or normalize_company_symbol(row.get("stock_id"))
+            if target_sym and row_sym == target_sym:
+                for k in fieldnames:
+                    if k in entry and entry[k] is not None:
+                        row[k] = str(entry[k])
+                updated = True
+                break
+
+        if not updated:
+            new_row = {k: (str(entry.get(k, "")) if entry.get(k) is not None else "") for k in fieldnames}
+            rows.append(new_row)
+
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = list(entry.keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow({k: (str(v) if v is not None else "") for k, v in entry.items()})
+
+    if json_path.is_file():
+        try:
+            records = json.loads(json_path.read_text(encoding="utf-8"))
+            updated_json = False
+            for i, rec in enumerate(records):
+                rec_sym = normalize_company_symbol(rec.get("company_url")) or normalize_company_symbol(rec.get("stock_id"))
+                if target_sym and rec_sym == target_sym:
+                    records[i] = entry
+                    updated_json = True
+                    break
+            if not updated_json:
+                records.append(entry)
+            json_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        except Exception:
+            json_path.write_text(json.dumps([entry], indent=2), encoding="utf-8")
+    else:
+        json_path.write_text(json.dumps([entry], indent=2), encoding="utf-8")
+
+
+def upsert_current_run_stock(stock_data: dict[str, object], target_scope: str | None = None) -> None:
+    """Upsert an evaluated stock entry strictly into target_scope (current_run vs custom_stocks)."""
+    paths = current_paths()
+    s_id = stock_data.get("stock_id")
+    c_url = stock_data.get("company_url")
+    target_sym = normalize_company_symbol(c_url) or normalize_company_symbol(s_id)
+
+    if not target_scope:
+        is_current = bool(stock_data.get("is_current_run"))
+        if not is_current:
+            current_csv = paths.html_analysis_dir / "company_rule_results.csv"
+            if current_csv.is_file():
+                with current_csv.open(newline="", encoding="utf-8") as f:
+                    is_current = any(
+                        normalize_company_symbol(r.get("company_url")) == target_sym or
+                        normalize_company_symbol(r.get("stock_id")) == target_sym
+                        for r in csv.DictReader(f)
+                    )
+        target_scope = "current_run" if is_current else "custom_stocks"
+
+    if target_scope == "current_run":
+        # 1. Update company_rule_results (HTML analysis)
+        html_csv = paths.html_analysis_dir / "company_rule_results.csv"
+        html_json = paths.html_analysis_dir / "company_rule_results.json"
+        _upsert_csv_json_entry(html_csv, html_json, stock_data, target_sym)
+
+        # 2. Update excel_rule_results (Excel analysis) if excel results exist
+        if stock_data.get("excel_file"):
+            excel_csv = paths.excel_analysis_dir / "excel_rule_results.csv"
+            excel_json = paths.excel_analysis_dir / "excel_rule_results.json"
+            excel_entry = {
+                "company_name": stock_data.get("company_name", ""),
+                "company_url": stock_data.get("company_url", ""),
+                "excel_file": stock_data.get("excel_file", ""),
+                "rule_12_ssgr": stock_data.get("rule_12_ssgr", ""),
+                "rule_13_cfo_ebitda": stock_data.get("rule_13_cfo_ebitda", ""),
+                "ssgr": stock_data.get("ssgr", ""),
+                "cum_5y_cfo_ebitda": stock_data.get("cum_5y_cfo_ebitda", ""),
+                "cfo_pat": stock_data.get("cfo_pat", ""),
+            }
+            _upsert_csv_json_entry(excel_csv, excel_json, excel_entry, target_sym)
+
+        # 3. Combine outputs & update final/rule_filtered_stocks.csv and final/rule_filtered_stocks.json
+        combine_rule_outputs(paths)
+    else:
+        custom_analysis_dir = CUSTOM_STOCKS_DIR / "analysis"
+        custom_analysis_dir.mkdir(parents=True, exist_ok=True)
+
+        single_json = custom_analysis_dir / f"{target_sym}.json"
+        single_json.write_text(json.dumps(stock_data, indent=2), encoding="utf-8")
+
+        for old_j in CUSTOM_STOCKS_DIR.glob(f"{target_sym}*.json"):
+            if old_j.resolve() != single_json.resolve():
+                old_j.unlink(missing_ok=True)
+
+        c_csv = custom_analysis_dir / "custom_rule_results.csv"
+        c_json = custom_analysis_dir / "custom_rule_results.json"
+        _upsert_csv_json_entry(c_csv, c_json, stock_data, target_sym)
 
 
 def main() -> int:

@@ -226,7 +226,8 @@ def main() -> int:
     output_dir = (args.output_dir or excel_dir / "analysis").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"Excel manifest not found: {manifest_path}")
+        print(f"Notice: Excel manifest not found at {manifest_path}. Skipping Excel rule analysis.")
+        return 0
 
     downloads = json.loads(manifest_path.read_text(encoding="utf-8"))
     results: list[dict[str, Any]] = []

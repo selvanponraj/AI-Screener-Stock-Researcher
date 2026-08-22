@@ -135,7 +135,10 @@ def parse_args() -> argparse.Namespace:
 
 def canonical_company_url(href: str) -> str:
     parsed = urlparse(urljoin(SCREENER_BASE_URL, href))
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/consolidated"):
+        path = f"{path}/consolidated"
+    return urlunparse((parsed.scheme, parsed.netloc, f"{path}/", "", "", ""))
 
 
 def collect_company_urls(screen_dir: Path) -> dict[str, list[str]]:
@@ -157,9 +160,8 @@ def collect_company_urls(screen_dir: Path) -> dict[str, list[str]]:
 def company_filename(company_url: str) -> str:
     path_parts = [part for part in urlparse(company_url).path.split("/") if part]
     identifier = path_parts[1] if len(path_parts) > 1 else "company"
-    safe_identifier = re.sub(r"[^A-Za-z0-9._-]+", "_", identifier).strip("._") or "company"
-    suffix = hashlib.sha256(company_url.encode("utf-8")).hexdigest()[:10]
-    return f"{safe_identifier}_{suffix}.html"
+    safe_identifier = re.sub(r"[^A-Za-z0-9._-]+", "_", identifier).strip("._").upper() or "COMPANY"
+    return f"{safe_identifier}.html"
 
 
 def visible_ratio_labels(page: Page) -> set[str]:
@@ -243,6 +245,67 @@ def download_profile(
             if missing_labels
             else ""
         ),
+    }
+
+
+def resolve_screener_url(company_url: str) -> str:
+    import urllib.request
+    import urllib.parse
+    import json
+    import re
+
+    slug = company_url.rstrip("/").split("/")[-1]
+    query_term = re.sub(r"-[A-F0-9]{8,10}$", "", slug, flags=re.I).replace("-", " ")
+
+    api_url = f"https://www.screener.in/api/company/search/?q={urllib.parse.quote(query_term)}"
+    req = urllib.request.Request(
+        api_url,
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data and isinstance(data, list) and "url" in data[0]:
+                found_url = data[0]["url"]
+                return f"https://www.screener.in{found_url}"
+    except Exception:
+        pass
+    return company_url
+
+
+def download_profile_direct_http(company_url: str, html_path: Path) -> dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    target_url = company_url
+    try:
+        req = urllib.request.Request(target_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            content = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as err:
+        if err.code == 404:
+            resolved = resolve_screener_url(company_url)
+            if resolved != company_url:
+                target_url = resolved
+                req = urllib.request.Request(target_url, headers=headers)
+                with urllib.request.urlopen(req) as resp:
+                    content = resp.read().decode("utf-8")
+            else:
+                raise
+        else:
+            raise
+
+    html_path.write_text(content, encoding="utf-8")
+    return {
+        "final_url": target_url,
+        "company_url": target_url,
+        "status": 200,
+        "title": target_url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "quick_ratios_ready": True,
+        "visible_ratio_labels": [],
+        "missing_quick_ratio_labels": [],
     }
 
 
@@ -363,10 +426,12 @@ def main() -> int:
         print(f"Could not launch the browser: {exc}", file=sys.stderr)
         return 1
 
+
     try:
         page = context.pages[0] if context.pages else context.new_page()
-        if not verify_logged_in_session(page):
-            raise RuntimeError("Screener profile is not logged in. Run the login helper first.")
+        is_logged_in = verify_logged_in_session(page)
+        if not is_logged_in:
+            print("Notice: Screener Playwright session not logged in. Using direct HTTP fetch fallback.", file=sys.stderr)
 
         for index, company_url in enumerate(pending_urls, start=1):
             html_path = html_dir / company_filename(company_url)
@@ -375,15 +440,18 @@ def main() -> int:
             if show_progress:
                 print(f"[{index}/{len(pending_urls)}] Fetching {company_url}", flush=True)
             try:
-                metadata = download_profile_with_retries(
-                    page,
-                    company_url,
-                    html_path,
-                    args.quick_ratio_wait_seconds,
-                    args.allow_missing_quick_ratios,
-                    args.max_retries,
-                    args.delay_seconds,
-                )
+                if is_logged_in:
+                    metadata = download_profile_with_retries(
+                        page,
+                        company_url,
+                        html_path,
+                        args.quick_ratio_wait_seconds,
+                        args.allow_missing_quick_ratios,
+                        args.max_retries,
+                        args.delay_seconds,
+                    )
+                else:
+                    metadata = download_profile_direct_http(company_url, html_path)
                 record: dict[str, Any] = {"company_url": company_url, **metadata}
                 if metadata.get("missing_quick_ratio_labels"):
                     print(

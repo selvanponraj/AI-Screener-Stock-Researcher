@@ -376,6 +376,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.current_step = f"Analyzing {ticker}"
             try:
                 stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=False)
+                rules_pipeline.upsert_current_run_stock(stock_data)
                 with STATE.lock:
                     STATE.stocks = load_visible_stocks(STATE.pass_percentage)
                     STATE.phase = f"single stock complete: {stock_data.get('company_name', ticker)}"
@@ -403,10 +404,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length) or b"{}")
-        ticker = payload.get("ticker", "").strip() or payload.get("stock_id", "").strip()
+        company_url = payload.get("company_url", "").strip()
+        ticker_input = payload.get("ticker", "").strip() or payload.get("stock_id", "").strip()
+        stock_source = payload.get("stock_source", "").strip()
+
+        ticker = company_url or ticker_input
         if not ticker:
             self.send_json({"ok": False, "error": "Ticker input cannot be empty."}, status=400)
             return
+
+        target_scope = "current_run" if stock_source == "current_run" else "custom_stocks"
 
         def run_refresh_bg() -> None:
             with STATE.lock:
@@ -417,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.logs = []
                 STATE.current_step = f"Re-downloading & analyzing {ticker}"
             try:
-                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=True)
+                stock_data = rules_pipeline.analyze_single_stock(ticker, STATE.log, force=True, target_scope=target_scope)
                 with STATE.lock:
                     STATE.stocks = load_visible_stocks(STATE.pass_percentage)
                     STATE.phase = f"refresh complete: {stock_data.get('company_name', ticker)}"
@@ -1436,7 +1443,7 @@ INDEX_HTML = r"""
               <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px;">
                 <span class="stock-name" style="font-weight: 700; font-size: 1.05rem;">${escapeHtml(stock.company_name)}</span>
                 <span class="badge category-badge" style="font-size: 0.75rem; font-weight: 600; background: ${badgeBg}; color: ${badgeColor}; border: 1px solid rgba(0,0,0,0.1); padding: 2px 8px; border-radius: 12px;">${category}</span>
-                <button class="secondary btn-sm refresh-one" style="padding: 1px 5px; font-size: 0.85rem; line-height: 1; border-radius: 4px; cursor: pointer;" data-stock="${escapeAttr(stock.stock_id)}" data-name="${escapeAttr(stock.company_name)}" title="Re-download HTML, Excel & Reports for ${escapeAttr(stock.company_name)}">🔄</button>
+                <button class="secondary btn-sm refresh-one" style="padding: 1px 5px; font-size: 0.85rem; line-height: 1; border-radius: 4px; cursor: pointer;" data-stock="${escapeAttr(stock.stock_id)}" data-url="${escapeAttr(stock.company_url || '')}" data-source="${escapeAttr(stock.stock_source || '')}" data-name="${escapeAttr(stock.company_name)}" title="Re-download HTML, Excel & Reports for ${escapeAttr(stock.company_name)}">🔄</button>
               </div>
               <div style="font-size: 0.85rem; font-weight: 600; color: #1e293b; margin-bottom: 2px;">
                 Market Cap: <span style="color: #059669;">${mcapFormatted}</span>
@@ -1522,11 +1529,11 @@ INDEX_HTML = r"""
         btn.addEventListener('click', () => evaluate(btn.dataset.stock));
       });
       document.querySelectorAll('.refresh-one').forEach(btn => {
-        btn.addEventListener('click', () => refreshStock(btn.dataset.stock, btn.dataset.name));
+        btn.addEventListener('click', () => refreshStock(btn.dataset.stock, btn.dataset.name, btn.dataset.url, btn.dataset.source));
       });
     }
 
-    async function refreshStock(stockId, companyName) {
+    async function refreshStock(stockId, companyName, companyUrl, stockSource) {
       if (latest && latest.running) {
         alert("A job is currently running. Please wait for it to complete.");
         return;
@@ -1538,7 +1545,7 @@ INDEX_HTML = r"""
         const res = await api('/api/refresh-stock', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ticker: stockId })
+          body: JSON.stringify({ ticker: stockId, company_url: companyUrl, stock_source: stockSource })
         });
         if (!res.ok) {
           alert("Error initiating refresh: " + (res.error || "Unknown error"));

@@ -64,19 +64,64 @@ def all_present(*values: Optional[float]) -> bool:
     return all(value is not None and math.isfinite(value) for value in values)
 
 
-def quick_ratios(soup: BeautifulSoup) -> dict[str, Optional[float]]:
-    ratios: dict[str, Optional[float]] = {}
+def calculate_fallback_debt_to_equity(soup: BeautifulSoup) -> float | None:
+    bs = soup.find("section", id="balance-sheet")
+    if not bs:
+        return None
+    data: dict[str, float] = {}
+    for r in bs.select("tbody tr"):
+        tds = r.find_all("td")
+        if tds:
+            title = clean_text(tds[0]).lower().rstrip(" +")
+            val = parse_number(tds[-1])
+            if val is not None:
+                data[title] = val
+    eq = data.get("equity capital", 0.0) + data.get("reserves", 0.0)
+    bor = data.get("borrowings", 0.0)
+    if eq > 0:
+        return round(bor / eq, 2)
+    return None
+
+
+def calculate_fallback_pledged_percentage(soup: BeautifulSoup) -> float | None:
+    sh = soup.find("section", id="shareholding")
+    if not sh:
+        return None
+    for r in sh.select("tbody tr"):
+        tds = r.find_all("td")
+        if tds:
+            title = clean_text(tds[0]).lower()
+            if "pledge" in title:
+                val = parse_number(tds[-1])
+                if val is not None:
+                    return val
+    return 0.0
+
+
+def quick_ratios(soup: BeautifulSoup) -> dict[str, float]:
+    ratios: dict[str, float] = {}
     for item in soup.select("li, div.ratio-item, tr"):
         name = item.select_one("span.name, span.title, td.name, span.label")
         value = item.select_one("span.value span.number, span.number, td.number, span.value")
         if name and value:
             clean_name = clean_text(name)
             parsed_val = parse_number(value)
-            ratios[clean_name] = parsed_val
+            if parsed_val is not None:
+                ratios[clean_name] = parsed_val
 
-    if "Market Cap" not in ratios or ratios["Market Cap"] is None:
+    if "Debt to equity" not in ratios:
+        de_fallback = calculate_fallback_debt_to_equity(soup)
+        if de_fallback is not None:
+            ratios["Debt to equity"] = de_fallback
+
+    if "Pledged percentage" not in ratios:
+        pledged_fallback = calculate_fallback_pledged_percentage(soup)
+        if pledged_fallback is not None:
+            ratios["Pledged percentage"] = pledged_fallback
+
+    if "Market Cap" not in ratios:
         for k, v in ratios.items():
-            if "market cap" in k.lower() and v is not None:
+            if "market cap" in k.lower():
                 ratios["Market Cap"] = v
                 break
 
@@ -278,6 +323,167 @@ def market_classification(soup: BeautifulSoup) -> dict[str, Any]:
     }
 
 
+def calculate_fallback_historical_pe(soup: BeautifulSoup, cur_price: float | None) -> dict[int, float | None]:
+    if not cur_price or cur_price <= 0:
+        return {3: None, 5: None, 7: None}
+
+    pnl = soup.find("section", id="profit-loss")
+    if not pnl:
+        return {3: None, 5: None, 7: None}
+
+    eps_tr = next((tr for tr in pnl.select("tbody tr") if "eps" in clean_text(tr.find("td")).lower()), None)
+    if not eps_tr:
+        return {3: None, 5: None, 7: None}
+
+    eps_vals = [parse_number(td) for td in eps_tr.find_all("td")[1:]]
+    eps_vals = [v for v in eps_vals if v is not None and v > 0]
+    if not eps_vals:
+        return {3: None, 5: None, 7: None}
+
+    pes = [round(cur_price / v, 1) for v in eps_vals]
+    import statistics
+
+    res: dict[int, float | None] = {}
+    for period in (3, 5, 7):
+        if len(pes) >= period:
+            res[period] = round(float(statistics.median(pes[-period:])), 1)
+        else:
+            res[period] = None
+    return res
+
+
+def calculate_industry_pe_fallback(market: dict[str, Any], html_path: Path) -> float | None:
+    csv_path = Path("data/current_run/companies/analysis/company_rule_results.csv")
+    if not csv_path.is_file():
+        csv_path = html_path.parent.parent / "analysis" / "company_rule_results.csv"
+    if not csv_path.is_file():
+        return None
+
+    industry_names = [cat["value"].lower() for cat in market.get("categories", [])]
+    if not industry_names:
+        return None
+
+    import csv
+    import statistics
+
+    matching_pes: list[float] = []
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                cats = row.get("market_categories", "").lower()
+                stock_pe = parse_number(row.get("stock_pe"))
+                if stock_pe and stock_pe > 0:
+                    if any(ind in cats for ind in industry_names):
+                        matching_pes.append(stock_pe)
+    except Exception:
+        pass
+
+    if matching_pes:
+        return round(float(statistics.median(matching_pes)), 1)
+    return None
+
+
+def calculate_fallback_cfo_ebitda_pat(soup: BeautifulSoup) -> dict[str, Any]:
+    """Calculate Rule 14 (CFO/EBITDA >= 65% and CFO/PAT >= 80%) from HTML Cash Flow and P&L tables."""
+    cfo_values: list[float] = []
+    cf_section = soup.find("section", id="cash-flow")
+    if cf_section:
+        cf_table = cf_section.find("table")
+        if cf_table:
+            for row in cf_table.find_all("tr"):
+                row_text = row.get_text(" ", strip=True).lower()
+                if "cash from operating activity" in row_text or "operating activity" in row_text:
+                    cols = [td.get_text(strip=True).replace(",", "") for td in row.find_all(["td", "th"])[1:]]
+                    for c in cols:
+                        clean_c = c.replace("-", "").replace(".", "")
+                        if clean_c.isdigit():
+                            try:
+                                cfo_values.append(float(c))
+                            except ValueError:
+                                pass
+                    break
+
+    ebitda_values: list[float] = []
+    pat_values: list[float] = []
+    pnl_section = soup.find("section", id="profit-loss")
+    if pnl_section:
+        pnl_table = pnl_section.find("table")
+        if pnl_table:
+            for row in pnl_table.find_all("tr"):
+                row_text = row.get_text(" ", strip=True).lower()
+                if "operating profit" in row_text and not ebitda_values:
+                    cols = [td.get_text(strip=True).replace(",", "") for td in row.find_all(["td", "th"])[1:]]
+                    for c in cols:
+                        if c.replace("-", "").replace(".", "").isdigit():
+                            try:
+                                ebitda_values.append(float(c))
+                            except ValueError:
+                                pass
+                elif "net profit" in row_text and not pat_values:
+                    cols = [td.get_text(strip=True).replace(",", "") for td in row.find_all(["td", "th"])[1:]]
+                    for c in cols:
+                        if c.replace("-", "").replace(".", "").isdigit():
+                            try:
+                                pat_values.append(float(c))
+                            except ValueError:
+                                pass
+
+    if not cfo_values or not ebitda_values or not pat_values:
+        return {"rule_13_cfo_ebitda": "missing"}
+
+    cfo_5y = sum(cfo_values[-5:])
+    ebitda_5y = sum(ebitda_values[-5:])
+    pat_5y = sum(pat_values[-5:])
+
+    cfo_ebitda_ratio = (cfo_5y / ebitda_5y * 100.0) if ebitda_5y > 0 else 0.0
+    cfo_pat_ratio = (cfo_5y / pat_5y * 100.0) if pat_5y > 0 else 0.0
+
+    rule_pass = (cfo_ebitda_ratio >= 65.0) and (cfo_pat_ratio >= 80.0)
+    return {
+        "rule_13_cfo_ebitda": "pass" if rule_pass else "fail",
+        "cum_cfo_5y": str(round(cfo_5y, 2)),
+        "cum_ebitda_5y": str(round(ebitda_5y, 2)),
+        "cum_pat_5y": str(round(pat_5y, 2)),
+        "cfo_ebitda_cum_ratio": str(round(cfo_ebitda_ratio, 2)),
+        "cfo_pat_cum_ratio": str(round(cfo_pat_ratio, 2)),
+    }
+
+
+def calculate_fallback_ssgr(soup: BeautifulSoup, sales_cagr_3y: float | None, roe: float | None) -> dict[str, Any]:
+    """Calculate Rule 13 (SSGR > 10% and >= 3Y Sales CAGR) from HTML tables."""
+    dpr_3y: list[float] = []
+    pnl_section = soup.find("section", id="profit-loss")
+    if pnl_section:
+        pnl_table = pnl_section.find("table")
+        if pnl_table:
+            for row in pnl_table.find_all("tr"):
+                row_text = row.get_text(" ", strip=True).lower()
+                if "dividend payout" in row_text:
+                    cols = [td.get_text(strip=True).replace("%", "").replace(",", "") for td in row.find_all(["td", "th"])[1:]]
+                    nums = []
+                    for c in cols:
+                        if c.replace("-", "").replace(".", "").isdigit():
+                            try:
+                                nums.append(float(c))
+                            except ValueError:
+                                pass
+                    dpr_3y = nums[-3:]
+                    break
+
+    if roe is None or not dpr_3y or len(dpr_3y) < 3:
+        return {"rule_12_ssgr": "missing"}
+
+    avg_dpr = sum(dpr_3y) / len(dpr_3y) / 100.0
+    ssgr_3y_avg = roe * (1.0 - avg_dpr)
+
+    pass_rule = (ssgr_3y_avg > 10.0) and (sales_cagr_3y is not None and ssgr_3y_avg >= sales_cagr_3y)
+    return {
+        "rule_12_ssgr": "pass" if pass_rule else "fail",
+        "ssgr_3y_avg": str(round(ssgr_3y_avg, 2)),
+        "excel_sales_cagr_3y": str(round(sales_cagr_3y, 2)) if sales_cagr_3y is not None else "",
+    }
+
+
 def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
     soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
     ratios = quick_ratios(soup)
@@ -285,7 +491,15 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
 
     stock_pe = ratios.get("Stock P/E")
     industry_pe = ratios.get("Industry PE")
+    if industry_pe is None:
+        industry_pe = calculate_industry_pe_fallback(market, html_path)
+
     historical_pe = {period: ratios.get(f"{period}Yrs PE") for period in (3, 5, 7)}
+    if all(v is None for v in historical_pe.values()):
+        cur_price = ratios.get("Current Price")
+        fallback_pe = calculate_fallback_historical_pe(soup, cur_price)
+        historical_pe.update({k: v for k, v in fallback_pe.items() if v is not None})
+
     historical_pe_passes = sum(
         stock_pe <= 1.1 * value
         for value in historical_pe.values()
@@ -383,6 +597,14 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
         "revenue_quality_guard": status(rev_quality_pass),
     }
 
+    # HTML fallbacks for Rule 13 (SSGR) & Rule 14 (CFO/EBITDA)
+    cfo_fallback = calculate_fallback_cfo_ebitda_pat(soup)
+    ssgr_fallback = calculate_fallback_ssgr(soup, sales_3y, ratios.get("ROE"))
+    rule_statuses.update({
+        "rule_12_ssgr": ssgr_fallback.get("rule_12_ssgr", "missing"),
+        "rule_13_cfo_ebitda": cfo_fallback.get("rule_13_cfo_ebitda", "missing"),
+    })
+
     all_rules_pass = all(rule == "pass" for rule in rule_statuses.values())
     return {
         "company_name": company_name(soup, html_path),
@@ -400,6 +622,8 @@ def analyze_company(html_path: Path, company_url: str | None) -> dict[str, Any]:
             "pledged_percentage": ratios.get("Pledged percentage"),
             "peg_ratio": peg_ratio,
             "effective_cagr": effective_cagr,
+            **{k: v for k, v in cfo_fallback.items() if k != "rule_13_cfo_ebitda"},
+            **{k: v for k, v in ssgr_fallback.items() if k != "rule_12_ssgr"},
         },
         "profit_growth": profit_periods,
         "stock_price_cagr": price_periods,

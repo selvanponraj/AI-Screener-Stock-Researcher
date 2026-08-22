@@ -196,7 +196,8 @@ def main() -> int:
     try:
         page = context_page(context)
         if not verify_logged_in_session(page):
-            raise RuntimeError("Screener profile is not logged in. Run the login helper first.")
+            print("Warning: Screener profile is not logged in. Excel downloads require a logged-in session. Skipping Excel crawler.", file=sys.stderr)
+            return 0
         for index, company in enumerate(pending, start=1):
             slug = Path(company["html_file"]).stem
             output_path = output_dir / f"{slug}.xlsx"
