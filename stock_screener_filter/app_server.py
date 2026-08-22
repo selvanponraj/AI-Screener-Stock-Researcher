@@ -1223,11 +1223,44 @@ INDEX_HTML = r"""
   <div id="rulesGuideModal" class="modal-overlay">
     <div class="modal-card">
       <div class="modal-header">
-        <h2>📖 Stock Screener - 14 Quantitative Rules Guide</h2>
+        <h2>📖 Stock Screener - 14 Quantitative Rules & Market-Cap Tiers Guide</h2>
         <button id="closeRulesModalBtn" class="close-modal-btn">&times;</button>
       </div>
       <div style="font-size:13px; color:#64748b; margin-bottom:16px;">
-        Overview of all 14 quantitative filter rules, formulas, and financial meaning.
+        Overview of market-cap tiering thresholds, 14 quantitative filter rules, formulas, and financial meaning.
+      </div>
+      <div style="margin-bottom: 20px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px;">
+        <h3 style="margin:0 0 8px 0; font-size:14px; font-weight:700; color:#1e293b;">📊 Market-Cap Tiering Thresholds</h3>
+        <table style="width:100%; border-collapse:collapse; font-size:12px; margin:0;">
+          <thead>
+            <tr style="background:#edf2f7; text-align:left;">
+              <th style="padding:6px 10px; border-bottom:1px solid #cbd5e1;">Market-Cap Tier</th>
+              <th style="padding:6px 10px; border-bottom:1px solid #cbd5e1;">Market Cap Range (₹ Cr)</th>
+              <th style="padding:6px 10px; border-bottom:1px solid #cbd5e1;">Sales CAGR Floor (Rule 7)</th>
+              <th style="padding:6px 10px; border-bottom:1px solid #cbd5e1;">YoY Growth Floor (Rule 7)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td style="padding:6px 10px;"><span class="badge" style="background:#dbeafe; color:#1d4ed8; font-weight:700;">Large-Cap</span></td>
+              <td style="padding:6px 10px; font-weight:600;">&gt; ₹50,000 Cr</td>
+              <td style="padding:6px 10px;">&ge; 10%</td>
+              <td style="padding:6px 10px;">&ge; 10% (in 60%+ observations)</td>
+            </tr>
+            <tr>
+              <td style="padding:6px 10px;"><span class="badge" style="background:#fef3c7; color:#b45309; font-weight:700;">Mid-Cap</span></td>
+              <td style="padding:6px 10px; font-weight:600;">₹10,000 Cr &ndash; ₹50,000 Cr</td>
+              <td style="padding:6px 10px;">&ge; 12%</td>
+              <td style="padding:6px 10px;">&ge; 10% (in 60%+ observations)</td>
+            </tr>
+            <tr>
+              <td style="padding:6px 10px;"><span class="badge" style="background:#e0e7ff; color:#4338ca; font-weight:700;">Small-Cap</span></td>
+              <td style="padding:6px 10px; font-weight:600;">&lt; ₹10,000 Cr</td>
+              <td style="padding:6px 10px;">&ge; 15%</td>
+              <td style="padding:6px 10px;">&ge; 12% (in 60%+ observations)</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
       <div class="rule-card-grid">
         <div class="rule-card-item">

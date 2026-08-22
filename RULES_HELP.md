@@ -1,6 +1,18 @@
 # Stock Researcher - Quantitative Rules Help & Reference Guide
 
-This document provides a comprehensive summary and plain-language explanation for all **14 Quantitative Filtering Rules** used by the Stock Researcher Screener Pipeline.
+This document provides a comprehensive summary and plain-language explanation for all **14 Quantitative Filtering Rules** and **Market-Cap Tiering Thresholds** used by the Stock Researcher Screener Pipeline.
+
+---
+
+## Market-Cap Tier Thresholds
+
+The screener categorizes stocks into three market-capitalization tiers based on total Market Cap (in ₹ Crores). These tiers dynamically adjust quantitative growth expectations (such as Sales CAGR and YoY Growth floors in Rule 7) so large-cap bluechip companies are evaluated fairly alongside fast-growing small-cap companies:
+
+| Market-Cap Tier | Market Cap Range (₹ Cr) | Sales CAGR Threshold (Rule 7) | YoY Growth Floor (Rule 7) | YoY Hit Rate Required |
+| :--- | :--- | :--- | :--- | :--- |
+| **Large-Cap** | $> \text{₹}50,000\text{ Cr}$ | $\ge 10\%$ | $\ge 10\%$ | $\ge 60\%$ of observations |
+| **Mid-Cap** | $\text{₹}10,000\text{ Cr} - \text{₹}50,000\text{ Cr}$ | $\ge 12\%$ | $\ge 10\%$ | $\ge 60\%$ of observations |
+| **Small-Cap** | $< \text{₹}10,000\text{ Cr}$ | $\ge 15\%$ | $\ge 12\%$ | $\ge 60\%$ of observations |
 
 ---
 
