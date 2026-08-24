@@ -18,11 +18,14 @@ from bs4 import BeautifulSoup
 from stock_screener_filter import company_rule_analyzer
 
 
+from stock_screener_filter.config import load_env
+load_env()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CURRENT_RUN_DIR = PROJECT_ROOT / "data" / "current_run"
 CUSTOM_STOCKS_DIR = PROJECT_ROOT / "data" / "custom_stocks"
 RISKY_BETS_DIR = PROJECT_ROOT / "data" / "risky_bets"
-RISKY_BET_SCREENER_URL = "https://www.screener.in/screens/3899369/multi-bagger-cwip/"
+RISKY_BET_SCREENER_URL = os.getenv("RISKY_BET_SCREENER_URL", "https://www.screener.in/screens/3899369/multi-bagger-cwip/")
 
 FIRST_STAGE_RULE_COLUMNS = (
     "pe_vs_industry",
