@@ -437,14 +437,28 @@ python -m stock_screener_filter.company_rule_analyzer --company-dir data/current
 
 Download Excel exports:
 
+
 ```bash
 python -m stock_screener_filter.company_excel_crawler --analysis-csv data/current_run/companies/analysis/company_rule_results.csv --output-dir data/current_run/companies/excel --min-passing-rules 6 --delay-seconds 10 --resume
+
+python -m stock_screener_filter.company_excel_crawler \
+  --analysis-csv "data/risky_bets/companies/analysis/company_rule_results.csv" \
+  --output-dir "data/risky_bets/companies/excel" \
+  --min-passing-rules 0 \
+  --delay-seconds 10 \
+  --resume
 ```
+Note: If you run this command and it crashes, times out, or you stop it manually, 
+you can run the exact same command but add --resume to the end of it. This tells the script to check the manifest.json cache, skip all the companies that already have Excel files downloaded, and only attempt to download the missing ones (like IMFA):
 
 Run Excel rules:
 
 ```bash
 python -m stock_screener_filter.company_excel_rule_analyzer --excel-dir data/current_run/companies/excel --output-dir data/current_run/companies/excel/analysis
+
+python -m stock_screener_filter.company_excel_rule_analyzer \
+  --excel-dir data/risky_bets/companies/excel \
+  --output-dir data/risky_bets/companies/excel/analysis
 ```
 
 Run single stock analysis (e.g., TCS):
@@ -464,6 +478,12 @@ python -m stock_screener_filter.company_profile_crawler --screen-dir "C:\path wi
 ```
 
 ## Documents, RAG, And AI Evaluation
+
+```
+python download_reports/download_reports.py GPPL --type concall --years 5 --source bse
+python download_reports/download_reports.py GPPL --type concall --years 5 --source screener
+python download_reports/upload_reports.py GPPL
+```
 
 After the quantitative pipeline finishes, the UI shows the stocks that passed
 the rule filter.

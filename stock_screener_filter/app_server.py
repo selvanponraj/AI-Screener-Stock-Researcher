@@ -20,6 +20,7 @@ from stock_screener_filter import ai_evaluator, document_store, rules_pipeline, 
 
 
 load_env()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("STOCK_RESEARCHER_PORT", "8765"))
 
@@ -85,10 +86,21 @@ def load_visible_stocks(pass_percentage: float = 0.0) -> list[dict[str, Any]]:
         key = f"custom_{stock_id}" if stock_id in stocks_by_id else stock_id
         stocks_by_id[key] = {**stock, "stock_source": "custom_single_stock"}
 
-    # 3. Document store stocks
+    # 3. Load Risky-Bet stocks under risky_bet keys
+    for stock in rules_pipeline.load_risky_bet_stocks():
+        stock_id = str(stock["stock_id"])
+        key = f"risky_{stock_id}" if stock_id in stocks_by_id else stock_id
+        stocks_by_id[key] = {
+            **stock,
+            "stock_source": "risky_bet",
+            "is_risky_bet_stock": True,
+            "screen_url": rules_pipeline.RISKY_BET_SCREENER_URL,
+        }
+
+    # 4. Document store stocks
     for stock in document_store.stocks_with_documents():
         stock_id = str(stock["stock_id"])
-        if stock_id not in stocks_by_id and f"custom_{stock_id}" not in stocks_by_id:
+        if stock_id not in stocks_by_id and f"custom_{stock_id}" not in stocks_by_id and f"risky_{stock_id}" not in stocks_by_id:
             stocks_by_id[stock_id] = dict(stock)
 
     enriched = []
@@ -290,7 +302,7 @@ def evaluate_background(stock_id: str | None) -> None:
             stock
             for stock in stocks
             if (not stock_id or stock.get("stock_id") == stock_id or stock_id == f"custom_{stock.get('stock_id')}")
-            and stock.get("stock_source") in {"rule_filtered", "current_run", "custom_single_stock"}
+            and stock.get("stock_source") in {"rule_filtered", "current_run", "custom_single_stock", "risky_bet"}
         ]
         if not selected:
             STATE.log("No rule-filtered stocks selected for AI evaluation.")
@@ -328,8 +340,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self.send_html(INDEX_HTML)
+        elif parsed.path in ("/risky-bet", "/cwip/multi-bagger.html", "/multi-bagger.html"):
+            self.send_risky_bets_html()
+        elif parsed.path == "/api/risky-bets":
+            stocks = rules_pipeline.load_risky_bet_stocks()
+            self.send_json({"ok": True, "stocks": stocks})
         elif parsed.path == "/api/status":
             self.send_json(STATE.snapshot())
+        elif parsed.path == "/api/live-prices":
+            self.send_live_prices(parsed.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -339,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
             self.start_pipeline()
         elif parsed.path == "/api/run-step":
             self.start_step()
+        elif parsed.path == "/api/fetch-risky-bets":
+            self.start_risky_bets_job()
         elif parsed.path == "/api/upload":
             self.upload_document()
         elif parsed.path == "/api/evaluate":
@@ -353,6 +374,127 @@ class Handler(BaseHTTPRequestHandler):
             self.refresh_stock()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def send_risky_bets_html(self) -> None:
+        try:
+            html_path = PROJECT_ROOT / "cwip" / "multi-bagger.html"
+            if not html_path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "cwip/multi-bagger.html not found.")
+                return
+            content = html_path.read_text(encoding="utf-8")
+            cwip_items = []
+            try:
+                stocks = rules_pipeline.load_risky_bet_stocks()
+                cwip_items = []
+                for s in stocks:
+                    if s.get("cwip_metrics"):
+                        item = s["cwip_metrics"]
+                        val = s.get("historical_pe", "")
+                        try:
+                            import ast
+                            item["historicalPE"] = ast.literal_eval(val) if val.startswith('{') else {}
+                        except Exception:
+                            item["historicalPE"] = {}
+                        cwip_items.append(item)
+                
+                if not cwip_items and stocks:
+                    from bs4 import BeautifulSoup
+                    paths = rules_pipeline.risky_bets_paths()
+                    for s in stocks:
+                        sym = s.get("stock_id", "")
+                        hp = paths.companies_dir / f"{sym}.html"
+                        if hp.is_file():
+                            try:
+                                soup = BeautifulSoup(hp.read_text(encoding="utf-8"), "html.parser")
+                                cwip_items.append(rules_pipeline.extract_cwip_metrics(soup, s))
+                            except Exception:
+                                pass
+            except Exception as ex:
+                print(f"[app_server] Warning loading risky bets data: {ex}")
+
+            cwip_items = [it for it in cwip_items if isinstance(it, dict)]
+            for item in cwip_items:
+                if not isinstance(item, dict):
+                    continue
+                
+                stock_id = item.get("stock_id", item.get("id", ""))
+                
+                # Fetch AI Evaluation Results
+                ai_eval = None
+                try:
+                    from stock_screener_filter import ai_evaluator
+                    ai_eval = ai_evaluator.current_evaluation(stock_id)
+                except Exception as e:
+                    print(f"[app_server] Error fetching AI evaluation for {stock_id}: {e}")
+                    
+                item.setdefault("rating", "Risky-Bet")
+                item.setdefault("cwipDetail", f"CWIP expansion of ₹{item.get('cwipCr', 0)} Cr ({item.get('cwipSalesPct', 0)}% of sales)")
+                
+                if ai_eval:
+                    item["guidance"] = ai_eval.get("guidance", [])
+                    item["redFlags"] = ai_eval.get("key_reasons", [])
+                    
+                    ai_score = ai_eval.get("ai_score_out_of_50", 0)
+                    rule_score = ai_eval.get("rule_score_out_of_50", 0)
+                    # For score mapping (out of 10), we can just take the total score (out of 100) and divide by 10
+                    # or keep existing scoring. Let's merge AI score.
+                    item["score"] = round((ai_score + rule_score) / 10.0, 1)
+                else:
+                    item.setdefault("guidance", [])
+                    item.setdefault("redFlags", [])
+
+                item.setdefault("riskFlags", [])
+                item.setdefault("keyRisks", ["Low D/E & debt profile"])
+                item.setdefault("catalystEvents", ["Capex expansion in progress"])
+
+            injected_script = f"<script>window.__RISKY_BETS_DATA__ = {json.dumps(cwip_items)};</script>\n"
+            if "</head>" in content:
+                content = content.replace("</head>", f"{injected_script}</head>", 1)
+            else:
+                content = injected_script + content
+
+            encoded = content.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except Exception as ex:
+            traceback.print_exc()
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(ex))
+
+    def start_risky_bets_job(self) -> None:
+        with STATE.lock:
+            if STATE.running:
+                self.send_json({"ok": False, "error": "A job is already running."}, status=409)
+                return
+
+        def run_bg() -> None:
+            with STATE.lock:
+                STATE.running = True
+                STATE.step = "risky_bets"
+                STATE.message = "Running Risky-Bets Screener crawl & quantitative analysis..."
+                STATE.current_run_summary = None
+
+            def log(msg: str) -> None:
+                with STATE.lock:
+                    STATE.message = msg
+
+            try:
+                stocks = rules_pipeline.run_risky_bets_pipeline(logger=log)
+                with STATE.lock:
+                    STATE.running = False
+                    STATE.step = "idle"
+                    STATE.message = f"Finished Risky-Bets Screener run! {len(stocks)} stocks processed."
+                    STATE.current_run_summary = rules_pipeline.pipeline_status()
+            except Exception as ex:
+                with STATE.lock:
+                    STATE.running = False
+                    STATE.step = "idle"
+                    STATE.message = f"Risky-Bets pipeline error: {ex}"
+
+        threading.Thread(target=run_bg, daemon=True).start()
+        self.send_json({"ok": True, "message": "Risky-Bets pipeline started."})
 
     def analyze_ticker(self) -> None:
         with STATE.lock:
@@ -1148,6 +1290,8 @@ INDEX_HTML = r"""
     <h1>Stock Researcher</h1>
       <div class="toolbar">
       <button id="rulesGuideBtn" class="secondary" style="font-weight:600; display:flex; align-items:center; gap:5px; margin-right:4px;">📖 Rules Guide</button>
+      <button id="fetchRiskyBetsBtn" class="secondary" style="font-weight:600; display:flex; align-items:center; gap:5px; margin-right:4px; background:#fff7ed; color:#c2410c; border:1px solid #ffedd5;">🔥 Fetch Risky-Bet Stocks</button>
+      <a href="/risky-bet" target="_blank" style="font-weight:600; text-decoration:none; font-size:13px; display:inline-flex; align-items:center; gap:5px; margin-right:4px; padding:6px 12px; background:#0f172a; color:#38bdf8; border-radius:6px;">🚀 CWIP Dashboard</a>
       <div style="display:flex; align-items:center; gap:6px; background:#f5f7fa; padding:3px 8px; border-radius:6px; border:1px solid var(--line);">
         <input id="tickerInput" type="text" placeholder="Ticker (e.g. TCS)" style="width:130px; padding:4px 8px; font-size:13px; border:1px solid var(--line); border-radius:4px;" />
         <button id="analyzeTickerBtn" class="secondary" style="padding:4px 10px; font-size:13px;">Analyze Ticker</button>
@@ -1158,6 +1302,7 @@ INDEX_HTML = r"""
           <option value="all" selected>All Analyzed Stocks</option>
           <option value="batch">Batch Screener Stocks</option>
           <option value="single">Single Stocks Only</option>
+          <option value="risky_bet">Risky-Bet Stocks (CWIP Multi-Bagger)</option>
         </select>
       </label>
       <label id="thresholdLabel" style="font-size:13px; font-weight:600; display:flex; align-items:center; gap:6px;">
@@ -1440,6 +1585,9 @@ INDEX_HTML = r"""
         }
         if (viewMode === 'batch') {
           return stock.stock_source === 'current_run' && Boolean(stock.passes_final_rule_filter);
+        }
+        if (viewMode === 'risky_bet') {
+          return stock.stock_source === 'risky_bet' || stock.is_risky_bet_stock || Boolean(stock.screen_url && stock.screen_url.includes('multi-bagger-cwip'));
         }
 
         return true;
@@ -1938,6 +2086,20 @@ ${renderQaTrace(result.trace, stockId, traceOpen)}
     });
 
     $('analyzeTickerBtn').addEventListener('click', handleAnalyzeTicker);
+    if ($('fetchRiskyBetsBtn')) {
+      $('fetchRiskyBetsBtn').addEventListener('click', async () => {
+        try {
+          const data = await api('/api/fetch-risky-bets', { method: 'POST' });
+          if (data.ok) {
+            alert('Risky-Bets Screener pipeline started! Crawling https://www.screener.in/screens/3899369/multi-bagger-cwip/ and evaluating 14 quantitative rules.');
+          } else {
+            alert(data.error || 'Failed to start Risky-Bets pipeline.');
+          }
+        } catch (e) {
+          alert('Request failed: ' + e.message);
+        }
+      });
+    }
     $('tickerInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') handleAnalyzeTicker();
     });

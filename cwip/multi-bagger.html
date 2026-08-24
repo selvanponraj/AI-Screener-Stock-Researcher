@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Risky Bets - Concentrated High Conviction</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap');
+        * { font-family: "Geist", system-ui, sans-serif; }
+        .mono { font-family: "Geist Mono", monospace; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 999px; }
+        body { background-color: #0a0a0b; color: #f4f4f5; }
+        .glass-card { background-color: #121212; border: 1px solid #27272a; border-radius: 20px; }
+    </style>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        zinc: { 800: '#27272a', 900: '#18181b' }
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="antialiased selection:bg-orange-500/30 min-h-screen">
+    <div id="app"></div>
+
+    <script>
+        // Use injected data or fallback to empty array
+        const DATA = window.__RISKY_BETS_DATA__ || [];
+
+        function formatCurrency(val) {
+            return new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(val);
+        }
+
+        function renderTopBar() {
+            return `
+            <div class="sticky top-0 z-30 backdrop-blur-xl bg-[#0a0a0b]/90 border-b border-zinc-900">
+                <div class="mx-auto max-w-[1200px] px-4 h-[56px] flex items-center justify-between">
+                    <div class="flex items-center gap-2.5">
+                        <div class="w-7 h-7 rounded-full bg-orange-500 text-black grid place-items-center">
+                            <i data-lucide="zap" class="w-[14px] h-[14px]"></i>
+                        </div>
+                        <div>
+                            <div class="text-[13px] font-bold tracking-tight leading-none">MIDCAP 250 • CWIP MULTIBAGGER</div>
+                            <div class="text-[10px] text-zinc-500 mono leading-none mt-0.5">RISKY BUCKET • LIVE DATA</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <div class="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-zinc-900 border border-zinc-800 mono text-[10px]">
+                            <span class="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse"></span>
+                            LIVE SCREENER
+                        </div>
+                        <div class="px-2.5 py-1 rounded-full bg-orange-500 text-black mono text-[10px] font-bold">DARK v2</div>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderStatsCard() {
+            return `
+            <div class="rounded-[20px] bg-[#141416] border border-zinc-800 overflow-hidden mb-4">
+                <div class="px-4 sm:px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-[12px] bg-orange-500/15 border border-orange-500/20 grid place-items-center">
+                            <i data-lucide="flask-conical" class="w-[18px] h-[18px] text-orange-400"></i>
+                        </div>
+                        <div>
+                            <div class="flex items-center gap-2">
+                                <h2 class="text-[13px] font-semibold uppercase tracking-wide">Risky Bucket 10%</h2>
+                                <span class="px-2 py-0.5 rounded-full bg-orange-500 text-black mono text-[10px] font-bold">₹7,22,150 of ₹72,21,504</span>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2 mt-1.5">
+                                <span class="px-2 py-0.5 rounded-full bg-zinc-900 border border-zinc-800 text-[10px] mono text-zinc-400">Max 5 stocks • 2% each = ₹1,44,430</span>
+                                <span class="px-2 py-0.5 rounded-full bg-red-500/10 border border-red-500/20 text-[10px] mono text-red-300 flex items-center gap-1">
+                                    <i data-lucide="trending-down" class="w-3 h-3"></i> SL 30% • 1% PF max loss / bet
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function renderStockTable(stocks) {
+            if (stocks.length === 0) {
+                return `<div class="p-10 text-center text-zinc-500 mono">No stocks matched the screener rules.</div>`;
+            }
+
+            const rows = stocks.map(stock => {
+                // Determine colors
+                const scoreColor = stock.score >= 8 ? 'bg-orange-500 text-black' : stock.score >= 6 ? 'bg-zinc-100 text-black' : 'bg-red-500/20 text-red-300 border border-red-500/20';
+                const cwipGrowthColor = stock.cwipGrowthYoY > 80 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/20' : 'bg-zinc-800 text-zinc-400 border border-zinc-700';
+                const fundingColor = stock.funding === 'CFO' ? 'bg-orange-500/20 text-orange-300' : 'bg-amber-500/20 text-amber-300';
+                const promoterColor = stock.promoterTrend === 'Down' ? 'text-red-300' : 'text-zinc-500';
+                const athColor = stock.athDistance > -10 ? 'bg-amber-500/10 border border-amber-500/20 text-amber-300' : stock.athDistance > -20 ? 'bg-zinc-800 border border-zinc-700 text-zinc-300' : 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-300';
+                const peColor = stock.currentPE < stock.avgPE ? 'text-emerald-400' : 'text-amber-400';
+
+                // Format Risks and Catalysts
+                const redFlags = (stock.redFlags || []).map(f => `<li class="text-red-400 flex items-start gap-2"><i data-lucide="alert-triangle" class="w-4 h-4 mt-0.5 shrink-0"></i><span>${f}</span></li>`).join('');
+                const risks = (stock.keyRisks || []).map(r => `<li class="text-yellow-400 flex items-start gap-2"><i data-lucide="alert-circle" class="w-4 h-4 mt-0.5 shrink-0"></i><span>${r}</span></li>`).join('');
+                const catalysts = (stock.catalystEvents || []).map(c => `<li class="text-emerald-400 flex items-start gap-2"><i data-lucide="trending-up" class="w-4 h-4 mt-0.5 shrink-0"></i><span>${c}</span></li>`).join('');
+
+                // Format Guidance
+                const guidance = (stock.guidance || []).map(g => {
+                    const statusColor = g.status === 'beat' ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/20' : g.status === 'miss' ? 'bg-red-500/15 text-red-300 border border-red-500/20' : 'bg-zinc-800 text-zinc-400 border border-zinc-700';
+                    return `
+                    <div class="rounded-[10px] bg-zinc-900 border border-zinc-800 px-3 py-2.5 flex items-center justify-between mb-1.5">
+                        <div class="mono text-[11px] font-medium w-[44px]">${g.year}</div>
+                        <div class="flex-1 grid grid-cols-2 gap-2 text-[10.5px]">
+                            <div><div class="text-zinc-500 text-[9px] uppercase">Guidance</div><div class="text-zinc-300 leading-tight">${g.guidance}</div></div>
+                            <div><div class="text-zinc-500 text-[9px] uppercase">Actual</div><div class="text-zinc-200 leading-tight">${g.actual}</div></div>
+                        </div>
+                        <span class="ml-2 px-2 py-0.5 rounded-full mono text-[9px] font-bold border ${statusColor}">${(g.status || 'N/A').toUpperCase()}</span>
+                    </div>`;
+                }).join('');
+
+                return `
+                <!-- Summary Row -->
+                <tr class="bg-[#121212] border-t border-zinc-800">
+                    <td class="p-3">
+                        <div class="flex items-center gap-2">
+                            <span class="mono font-semibold text-[13px] text-white uppercase">${stock.name || stock.id}</span>
+                            <span class="text-[11px] font-medium text-emerald-400 mono">₹${stock.cmp || 0}</span>
+                            ${stock.score >= 8 ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>' : ''}
+                        </div>
+                        <div class="text-[10px] text-zinc-500">${stock.sector || 'N/A'} • Mcap ${formatCurrency(stock.mcapCr || 0)}cr</div>
+                    </td>
+                    <td class="p-3">
+                        <div class="mono font-medium">₹${stock.cwipCr || 0}cr • ${stock.cwipSalesPct || 0}%</div>
+                        <div class="text-[10px] flex items-center gap-1 mt-0.5">
+                            <span class="px-1.5 py-0.5 rounded text-[9px] ${cwipGrowthColor}">+${stock.cwipGrowthYoY || 0}% YoY</span>
+                            <span class="px-1 py-0.5 rounded text-[9px] ${fundingColor}">${stock.funding || 'N/A'}</span>
+                        </div>
+                    </td>
+                    <td class="p-3">
+                        <div class="mono">${stock.roce5y || 0}% / ${stock.de || 0}</div>
+                        <div class="text-[10px] text-zinc-500 mt-0.5">ROE ${stock.roe5y || 0}% • FCF <span class="${stock.fcf5yPositive ? 'text-emerald-400' : 'text-red-400'}">${stock.fcf5yPositive ? '✔' : '✕'}</span></div>
+                    </td>
+                    <td class="p-3">
+                        <div class="mono">${stock.promoterPct || 0}% / ${stock.pledgePct || 0}%</div>
+                        <div class="text-[10px] ${promoterColor} mt-0.5">${stock.promoterTrend || 'N/A'} ${stock.promoterTrend === 'Down' ? '↓' : ''}</div>
+                    </td>
+                    <td class="p-3">
+                        <div class="flex items-center gap-1.5 mono">
+                            <span class="text-zinc-400">Cur:</span> 
+                            <span class="${peColor}">${stock.currentPE || 0}x</span>
+                        </div>
+                        <div class="text-[9px] mono text-zinc-500 mt-1 flex flex-col gap-0.5">
+                            ${stock.historicalPE && stock.historicalPE['3'] ? `<div>3yr: ${stock.historicalPE['3']}x <span class="${stock.currentPE < stock.historicalPE['3'] ? 'text-emerald-500' : 'text-amber-500'}">(${Math.abs(Math.round(((stock.historicalPE['3'] - stock.currentPE) / stock.historicalPE['3']) * 100))}% ${stock.currentPE < stock.historicalPE['3'] ? 'disc' : 'prem'})</span></div>` : ''}
+                            ${stock.historicalPE && stock.historicalPE['5'] ? `<div>5yr: ${stock.historicalPE['5']}x <span class="${stock.currentPE < stock.historicalPE['5'] ? 'text-emerald-500' : 'text-amber-500'}">(${Math.abs(Math.round(((stock.historicalPE['5'] - stock.currentPE) / stock.historicalPE['5']) * 100))}% ${stock.currentPE < stock.historicalPE['5'] ? 'disc' : 'prem'})</span></div>` : ''}
+                            ${stock.historicalPE && stock.historicalPE['7'] ? `<div>7yr: ${stock.historicalPE['7']}x <span class="${stock.currentPE < stock.historicalPE['7'] ? 'text-emerald-500' : 'text-amber-500'}">(${Math.abs(Math.round(((stock.historicalPE['7'] - stock.currentPE) / stock.historicalPE['7']) * 100))}% ${stock.currentPE < stock.historicalPE['7'] ? 'disc' : 'prem'})</span></div>` : ''}
+                        </div>
+                    </td>
+                    <td class="p-3">
+                        <div class="flex items-center gap-1">
+                            <span class="px-2 py-0.5 rounded-full mono text-[11px] font-bold ${scoreColor}">${stock.score || 0}/10</span>
+                        </div>
+                        <div class="text-[9px] mono text-zinc-500 mt-0.5">${stock.cwipScore || 0}-${stock.promoterScore || 0}-${stock.qualityScore || 0}</div>
+                    </td>
+                    <td class="p-3 text-center">
+                        <span class="px-2 py-0.5 rounded-full mono text-[11px] ${athColor}">₹${stock.athPrice || 0} (${stock.athDistance || 0}%)</span>
+                    </td>
+                </tr>
+                <!-- Fully Expanded Details Row -->
+                <tr class="bg-[#141416] border-b-[4px] border-black">
+                    <td colspan="7" class="p-4">
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <!-- Left Column: Scores & Analysis -->
+                            <div class="space-y-4">
+                                <div class="grid grid-cols-3 gap-2">
+                                    <div class="rounded-[12px] bg-zinc-900 border border-zinc-800 p-3">
+                                        <div class="text-[10px] uppercase mono text-zinc-500">CWIP Score ${stock.cwipScore}/4</div>
+                                        <div class="mt-1.5 space-y-1 text-[10.5px]">
+                                            <div class="flex justify-between"><span class="text-zinc-400">Sales >15%</span><span class="mono ${stock.cwipSalesPct > 15 ? 'text-emerald-300' : 'text-red-300'}">${stock.cwipSalesPct}% ${stock.cwipSalesPct > 15 ? '✔' : '✕'}</span></div>
+                                            <div class="flex justify-between"><span class="text-zinc-400">Growth >50%</span><span class="mono ${stock.cwipGrowthYoY > 50 ? 'text-emerald-300' : 'text-red-300'}">+${stock.cwipGrowthYoY}% ${stock.cwipGrowthYoY > 50 ? '✔' : '✕'}</span></div>
+                                        </div>
+                                    </div>
+                                    <div class="rounded-[12px] bg-zinc-900 border border-zinc-800 p-3">
+                                        <div class="text-[10px] uppercase mono text-zinc-500">Promoter ${stock.promoterScore}/3</div>
+                                        <div class="mt-1.5 space-y-1 text-[10.5px]">
+                                            <div class="flex justify-between"><span class="text-zinc-400">Holding</span><span class="mono text-zinc-200">${stock.promoterPct}% ${stock.promoterTrend}</span></div>
+                                            <div class="flex justify-between"><span class="text-zinc-400">Pledge</span><span class="mono ${stock.pledgePct < 5 ? 'text-emerald-300' : 'text-red-300'}">${stock.pledgePct}%</span></div>
+                                        </div>
+                                    </div>
+                                    <div class="rounded-[12px] bg-zinc-900 border border-zinc-800 p-3">
+                                        <div class="text-[10px] uppercase mono text-zinc-500">Quality ${stock.qualityScore}/3</div>
+                                        <div class="mt-1.5 space-y-1 text-[10.5px]">
+                                            <div class="flex justify-between"><span class="text-zinc-400">ROE 5y</span><span class="mono ${stock.roe5y > 15 ? 'text-emerald-300' : 'text-red-300'}">${stock.roe5y}%</span></div>
+                                            <div class="flex justify-between"><span class="text-zinc-400">ROCE 5y</span><span class="mono ${stock.roce5y > 18 ? 'text-emerald-300' : 'text-red-300'}">${stock.roce5y}%</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="rounded-[12px] bg-orange-500/10 border border-orange-500/20 px-3.5 py-3 flex gap-3">
+                                    <i data-lucide="wallet" class="w-5 h-5 text-orange-300 shrink-0"></i>
+                                    <div class="text-[11px] leading-relaxed text-orange-100/70">
+                                        <b class="text-orange-300">CWIP Read:</b> ${stock.cwipDetail || 'No detailed analysis available.'} 
+                                        <br/>Check Q concall: trial run date, capitalization schedule, funded by ${stock.funding || 'CFO'}.
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Right Column: Guidance, Risks & Catalysts -->
+                            <div class="space-y-4">
+                                ${stock.guidance && stock.guidance.length > 0 ? `
+                                <div>
+                                    <div class="text-[11px] font-semibold uppercase mono mb-2 flex items-center gap-2 text-zinc-300">
+                                        <i data-lucide="file-check" class="w-4 h-4 text-orange-400"></i> Guidance vs Actual • Lie Detector
+                                    </div>
+                                    <div>${guidance}</div>
+                                </div>` : ''}
+
+                                <div class="grid grid-cols-2 gap-3 mt-3">
+                                    <div class="rounded-[12px] bg-zinc-900 border border-zinc-800 p-3">
+                                        <h4 class="font-bold text-[10px] uppercase text-zinc-500 mb-2">Risks & Flags</h4>
+                                        <ul class="space-y-2 text-[10px]">
+                                            ${redFlags}
+                                            ${risks}
+                                            ${!redFlags && !risks ? '<li class="text-zinc-500">No flags reported.</li>' : ''}
+                                        </ul>
+                                    </div>
+                                    <div class="rounded-[12px] bg-zinc-900 border border-zinc-800 p-3">
+                                        <h4 class="font-bold text-[10px] uppercase text-zinc-500 mb-2">Catalysts</h4>
+                                        <ul class="space-y-2 text-[10px]">
+                                            ${catalysts || '<li class="text-zinc-500">No catalysts reported.</li>'}
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+
+            return `
+            <div class="rounded-[20px] bg-[#121212] border border-zinc-800 overflow-hidden mt-6">
+                <div class="px-4 sm:px-5 py-3 flex items-center justify-between border-b border-zinc-800">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="activity" class="w-4 h-4 text-orange-400"></i>
+                        <h3 class="text-[12px] font-semibold uppercase">Results • ${stocks.length} Stocks • Fully Expanded</h3>
+                    </div>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-[11px] min-w-[1080px]">
+                        <thead class="bg-zinc-900/80 text-[10px] uppercase mono text-zinc-500 sticky top-0 z-10">
+                            <tr>
+                                <th class="text-left p-3 font-medium">Stock / Sector</th>
+                                <th class="text-left p-3 font-medium">CWIP cr / Sales%</th>
+                                <th class="text-left p-3 font-medium">ROCE% / D/E</th>
+                                <th class="text-left p-3 font-medium">Prom% / Pledge%</th>
+                                <th class="text-left p-3 font-medium">AVG PE / Curr</th>
+                                <th class="text-left p-3 font-medium">Score 10</th>
+                                <th class="text-center p-3 font-medium">% ATH</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>`;
+        }
+
+        function init() {
+            const app = document.getElementById('app');
+            let html = renderTopBar();
+            html += '<div class="mx-auto max-w-[1200px] px-4 py-6 pb-20">';
+            html += renderStatsCard();
+            html += renderStockTable(DATA);
+            html += '</div>';
+            
+            app.innerHTML = html;
+            
+            if (window.lucide) {
+                lucide.createIcons();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

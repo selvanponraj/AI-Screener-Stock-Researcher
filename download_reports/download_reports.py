@@ -21,8 +21,8 @@ import os
 import re
 import argparse
 from datetime import datetime, timedelta
-from collections import defaultdict
 import requests
+from bs4 import BeautifulSoup
 from pathlib import Path
 from bse import BSE
 
@@ -38,10 +38,13 @@ ATTACHMENT_URLS = [
     "https://www.bseindia.com/xml-data/corpfiling/AttachHis/"
 ]
 
-EXCLUDE_ANNUAL_KEYWORDS = [
-    "notice", "convening", "newspaper", "publication", "dispatch",
-    "postal ballot", "reg. 36", "reg 36", "regulation 36", "voting results",
-    "intimation", "disclosure under"
+EXCLUDE_ANNUAL_STRICT = [
+    "newspaper", "publication", "postal ballot", "reg. 36", "reg 36", 
+    "regulation 36", "voting results", "disclosure under"
+]
+
+EXCLUDE_ANNUAL_WEAK = [
+    "notice", "convening", "dispatch", "intimation"
 ]
 
 
@@ -56,15 +59,18 @@ def determine_fy_and_period(dt_str: str, text: str, doc_type: str) -> tuple[str,
     """
     if doc_type == "report":
         text_upper = text.upper()
-        match = re.search(r'\bFY\s*(\d{2,4})\b', text_upper)
-        if match:
-            y_val = match.group(1)
-            return f"FY20{y_val}" if len(y_val) == 2 else f"FY{y_val}", "FY"
         
-        match = re.search(r'\b(20\d{2})\s*[-–/]\s*(\d{2,4})\b', text_upper)
+        # Check for year range (e.g. 2025-26, 25-26, FY 25-26) and extract end year
+        match = re.search(r'\b(?:20)?(\d{2})\s*[-–/]\s*(?:20)?(\d{2})\b', text_upper)
         if match:
             end_yr = match.group(2)
-            return f"FY20{end_yr}" if len(end_yr) == 2 else f"FY{end_yr}", "FY"
+            return f"FY20{end_yr}", "FY"
+            
+        # Fallback to single year (e.g. FY 2025, FY25)
+        match = re.search(r'\bFY\s*(?:20)?(\d{2})\b', text_upper)
+        if match:
+            y_val = match.group(1)
+            return f"FY20{y_val}", "FY"
 
         if dt_str:
             dt = datetime.strptime(dt_str[:10], '%Y-%m-%d')
@@ -121,11 +127,14 @@ def classify_announcement(item: dict, requested_type: str) -> str | None:
     doc_type = None
 
     if 'annual report' in text or 'reg. 34 (1)' in text or 'reg. 34' in text:
-        if not any(exc in headline or exc in newssub for exc in EXCLUDE_ANNUAL_KEYWORDS):
-            doc_type = 'report'
+        if not any(exc in headline or exc in newssub for exc in EXCLUDE_ANNUAL_STRICT):
+            has_explicit_annual_report = 'annual report' in headline or 'annual report' in newssub
+            has_weak_exclude = any(exc in headline or exc in newssub for exc in EXCLUDE_ANNUAL_WEAK)
+            if not has_weak_exclude or has_explicit_annual_report:
+                doc_type = 'report'
 
     elif 'transcript' in text:
-        if any(k in text for k in ['earnings', 'concall', 'conference call', 'investor call', 'call held']):
+        if any(k in text for k in ['earnings', 'concall', 'conference call', 'investor call', 'call held', 'investor meet', 'analyst meet', 'analyst/investor meet']):
             if not any(exc in headline or exc in newssub for exc in ["notice", "intimation", "analyst day"]):
                 doc_type = 'concall'
 
@@ -172,7 +181,7 @@ def download_attachment(attachment_name: str, save_path: Path) -> bool:
         url = base_url + attachment_name
         try:
             res = requests.get(url, headers=HEADERS, timeout=15)
-            if res.status_code == 200 and len(res.content) > 1000 and not res.content.startswith(b'<!DOCTYPE'):
+            if res.status_code == 200 and len(res.content) > 1000 and b'%PDF' in res.content[:20]:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 save_path.write_bytes(res.content)
                 print(f"  [Downloaded] {save_path.name} ({len(res.content) / 1024 / 1024:.2f} MB)")
@@ -213,11 +222,138 @@ def select_best_documents(found_docs: list) -> list:
     return selected_docs
 
 
+def parse_screener_concall_date(date_str: str) -> tuple[str, str, str]:
+    """Parses 'Aug 2026' into ('FY2027', 'Q1', '2026-08-01')."""
+    parts = date_str.strip().split()
+    if len(parts) < 2:
+        return "FY_UNKNOWN", "Q1", "2000-01-01"
+    
+    m_str, y_str = parts[0][:3].lower(), parts[1]
+    year = int(y_str)
+    
+    if m_str in ['jan', 'feb', 'mar']:
+        fy, q, dt = f"FY{year}", "Q3", f"{year}-02-01"
+    elif m_str in ['apr', 'may', 'jun']:
+        fy, q, dt = f"FY{year}", "Q4", f"{year}-05-01"
+    elif m_str in ['jul', 'aug', 'sep']:
+        fy, q, dt = f"FY{year + 1}", "Q1", f"{year}-08-01"
+    else: # oct, nov, dec
+        fy, q, dt = f"FY{year + 1}", "Q2", f"{year}-11-01"
+        
+    return fy, q, dt
+
+
+def download_from_screener(symbol: str, requested_type: str, output_base_dir: Path, years: int):
+    url = f"https://www.screener.in/company/{symbol.upper()}/consolidated/"
+    print(f"Fetching from Screener.in: {url}")
+    res = requests.get(url, headers=HEADERS, timeout=15)
+    if res.status_code != 200:
+        print(f"Error: Failed to fetch {url} (Status {res.status_code})")
+        return
+        
+    soup = BeautifulSoup(res.content, 'html.parser')
+    
+    target_fy_min = datetime.now().year - years
+    
+    if requested_type in ['report', 'all']:
+        ar_div = soup.find('div', class_='annual-reports')
+        if ar_div:
+            for a in ar_div.find_all('a'):
+                text = a.get_text(strip=True).replace('from bse', '').replace('from nse', '').strip()
+                href = a.get('href')
+                if not href: continue
+                
+                match = re.search(r'\d{4}', text)
+                if match:
+                    y_val = int(match.group(0))
+                    if y_val < target_fy_min:
+                        continue
+                    fy = f"FY{y_val}"
+                    dt_str = f"{y_val}-06-01"
+                    
+                    save_dir = output_base_dir / 'report'
+                    existing = find_existing_file(save_dir, 'report', fy, 'FY', dt_str)
+                    if existing:
+                        print(f"[REPORT] {fy} | Date={dt_str}\n  [Already Exists] {existing.name}")
+                        continue
+                    
+                    filename = f"{fy}_{dt_str}.pdf"
+                    pdf_save_path = save_dir / filename
+                    print(f"[REPORT] {fy} | Date={dt_str} -> {filename}")
+                    
+                    if href.startswith('/'):
+                        href = "https://www.screener.in" + href
+                    elif not href.startswith('http'):
+                        continue
+                        
+                    download_attachment_direct(href, pdf_save_path)
+
+    if requested_type in ['concall', 'all']:
+        cc_div = soup.find('div', class_='concalls')
+        if cc_div:
+            for li in cc_div.find_all('li'):
+                date_div = li.find('div', class_='ink-600')
+                if not date_div: continue
+                date_str = date_div.get_text(strip=True)
+                
+                transcript_a = None
+                for a in li.find_all('a', class_='concall-link'):
+                    text = a.get_text(strip=True).upper()
+                    if 'PPT' in text:
+                        transcript_a = a
+                        break
+                
+                # Fallback to transcript if PPT is missing
+                if not transcript_a:
+                    for a in li.find_all('a', class_='concall-link'):
+                        if 'TRANSCRIPT' in a.get_text(strip=True).upper():
+                            transcript_a = a
+                            break
+                        
+                if transcript_a:
+                    href = transcript_a.get('href')
+                    if not href: continue
+                    if href.startswith('/'): href = "https://www.screener.in" + href
+                    
+                    fy, q, dt_str = parse_screener_concall_date(date_str)
+                    if int(fy[2:]) < target_fy_min:
+                        continue
+                        
+                    save_dir = output_base_dir / 'concall'
+                    existing = find_existing_file(save_dir, 'concall', fy, q, dt_str)
+                    if existing:
+                        print(f"[CONCALL] {fy} | {q} | Date={dt_str}\n  [Already Exists] {existing.name}")
+                        continue
+                        
+                    filename = f"{fy}_{q}_{dt_str}.pdf"
+                    pdf_save_path = save_dir / filename
+                    print(f"[CONCALL] {fy} | {q} | Date={dt_str} -> {filename}")
+                    
+                    download_attachment_direct(href, pdf_save_path)
+
+
+def download_attachment_direct(url: str, save_path: Path) -> bool:
+    if save_path.exists(): return True
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=15)
+        if res.status_code == 200 and len(res.content) > 1000 and b'%PDF' in res.content[:20]:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(res.content)
+            print(f"  [Downloaded] {save_path.name} ({len(res.content) / 1024 / 1024:.2f} MB)")
+            return True
+        else:
+            print(f"  [Failed] Direct download failed from {url} (Status {res.status_code})")
+    except Exception as e:
+        print(f"  [Failed] Direct download failed from {url}: {e}")
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download BSE Annual Reports & Concall Transcripts")
     parser.add_argument("symbol", help="Stock Scrip Code (e.g., 532540) or Name (e.g., tcs)")
     parser.add_argument("--type", choices=["report", "concall", "all"], default="all", help="Document type: report (Annual) or concall (Transcripts)")
     parser.add_argument("--years", type=int, default=10, help="Number of years to fetch (default: 10)")
+    parser.add_argument("--source", choices=["screener", "bse"], default="screener", help="Source to download from (default: screener)")
     parser.add_argument("--output-dir", default="data/reports", help="Output directory (default: data/reports)")
 
     args = parser.parse_args()
@@ -227,9 +363,15 @@ def main():
 
     print("=== BSE Document Downloader ===")
     print(f"Target Symbol : {args.symbol}")
+    print(f"Source        : {args.source.upper()}")
     print(f"Filter Type   : {args.type.upper()}")
-    print(f"Date Range    : {from_date.strftime('%Y-%m-%d')} to {to_date.strftime('%Y-%m-%d')} ({args.years} Years)")
     print(f"Output Directory: {os.path.abspath(args.output_dir)}\n")
+    
+    output_base_dir = Path(args.output_dir) / args.symbol.lower()
+
+    if args.source == "screener":
+        download_from_screener(args.symbol, args.type, output_base_dir, args.years)
+        return
 
     with BSE(download_folder='./') as bse:
         scrip_code = args.symbol
@@ -244,9 +386,7 @@ def main():
         else:
             resolved_name = bse.getScripName(scrip_code)
             if resolved_name:
-                scrip_name = resolved_name.lower().replace(" ", "_")
-
-        output_base_dir = Path(args.output_dir) / scrip_name
+                output_base_dir = Path(args.output_dir) / resolved_name.lower().replace(" ", "_")
 
         page = 1
         found_docs = []

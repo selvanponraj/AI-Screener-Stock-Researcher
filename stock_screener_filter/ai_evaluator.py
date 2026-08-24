@@ -37,13 +37,20 @@ class SectionAnalysis(BaseModel):
     open_questions: list[str]
 
 
+class GuidanceItem(BaseModel):
+    year: str
+    guidance: str
+    actual: str
+    status: Literal["beat", "miss", "N/A"]
+
+
 class StockEvaluation(BaseModel):
     ai_score_out_of_50: float = Field(ge=0, le=50)
     total_score_out_of_100: float = Field(ge=0, le=100)
     verdict: str
     future_outlook: str
     initiatives_progress: str
-    promise_delivery: str
+    guidance: list[GuidanceItem] = Field(default_factory=list)
     news_sentiment_score: float = Field(ge=0, le=100)
     industry_outlook_score: float = Field(ge=0, le=100)
     exaggeration_risk_score: float = Field(ge=0, le=100)
@@ -106,7 +113,19 @@ EVALUATION_RESPONSE_SCHEMA: dict[str, Any] = {
         "verdict": {"type": "string"},
         "future_outlook": {"type": "string"},
         "initiatives_progress": {"type": "string"},
-        "promise_delivery": {"type": "string"},
+        "guidance": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "year": {"type": "string"},
+                    "guidance": {"type": "string"},
+                    "actual": {"type": "string"},
+                    "status": {"type": "string", "enum": ["beat", "miss", "N/A"]},
+                },
+                "required": ["year", "guidance", "actual", "status"],
+            },
+        },
         "news_sentiment_score": {"type": "number"},
         "industry_outlook_score": {"type": "number"},
         "exaggeration_risk_score": {"type": "number"},
@@ -119,7 +138,7 @@ EVALUATION_RESPONSE_SCHEMA: dict[str, Any] = {
         "verdict",
         "future_outlook",
         "initiatives_progress",
-        "promise_delivery",
+        "guidance",
         "news_sentiment_score",
         "industry_outlook_score",
         "exaggeration_risk_score",
@@ -527,7 +546,10 @@ Question-by-question AI analyses:
 Create the final stock evaluation. Use rule_score_out_of_50 as the deterministic first 50 points. Assign ai_score_out_of_50 from the question analyses only, considering:
 - future growth/outlook quality
 - concrete initiative progress
-- management promise delivery
+- management promise delivery (extract this into the `guidance` array showing past promise vs recent actuals).
+  Example format for guidance items: 
+  {{"year": "FY24", "guidance": "15% revenue growth", "actual": "delivered 12% revenue growth", "status": "miss"}}
+  If you cannot find specific guidance vs actuals, leave the guidance array empty instead of making up empty templates.
 - current news sentiment
 - industry tailwind/headwind
 - exaggeration or overpromising risk
@@ -538,7 +560,12 @@ Score fields:
 - industry_outlook_score: 0 means severe industry headwind, 50 means neutral/unclear, 100 means strong industry tailwind.
 - exaggeration_risk_score: 0 means low exaggeration/overpromising risk, 50 means moderate risk, 100 means severe risk.
 
-Return concise JSON matching the response schema. The final verdict should be practical for an investor.
+Text fields (DO NOT leave these empty):
+- verdict: Provide a 1-2 sentence practical verdict for an investor.
+- future_outlook: Summarize the future outlook based on the question analyses.
+- initiatives_progress: Summarize the progress of major initiatives.
+
+Return concise JSON matching the response schema.
 """.strip()
 
 
@@ -670,7 +697,25 @@ def validate_evaluation(parsed: dict[str, Any], stock: dict[str, Any]) -> dict[s
     parsed["verdict"] = ensure_str(parsed.get("verdict"))
     parsed["future_outlook"] = ensure_str(parsed.get("future_outlook"))
     parsed["initiatives_progress"] = ensure_str(parsed.get("initiatives_progress"))
-    parsed["promise_delivery"] = ensure_str(parsed.get("promise_delivery"))
+    
+    guidance_items = []
+    for g in parsed.get("guidance", []) or []:
+        if isinstance(g, dict):
+            status = str(g.get("status", "N/A")).lower()
+            if status == "beat":
+                status = "beat"
+            elif status == "miss":
+                status = "miss"
+            else:
+                status = "N/A"
+            guidance_items.append({
+                "year": ensure_str(g.get("year", "")),
+                "guidance": ensure_str(g.get("guidance", "")),
+                "actual": ensure_str(g.get("actual", "")),
+                "status": status,
+            })
+    parsed["guidance"] = guidance_items
+
     parsed["key_reasons"] = ensure_str_list(parsed.get("key_reasons"))
     parsed["open_questions"] = ensure_str_list(parsed.get("open_questions"))
 
